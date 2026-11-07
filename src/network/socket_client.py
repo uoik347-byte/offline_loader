@@ -45,15 +45,10 @@ _pack_int = pack_int
 logger = logging.getLogger(__name__)
 
 
-# One request, then one bounded read. A missing or denying policy still stops TCP.
-POLICY_FILE_REQUEST = b"<policy-file-request/>\x00"
-DEFAULT_POLICY_TIMEOUT = 5.0
-
-
-def bounded_policy_timeout(timeout: float | None) -> float:
-    if timeout is None:
-        return DEFAULT_POLICY_TIMEOUT
-    return min(15.0, max(0.5, float(timeout)))
+# The repository client does not send <policy-file-request/>. It reads a
+# server-pushed policy on the game socket, one byte at a time. This is the
+# initial per-byte wait; a received policy that denies the port still stops.
+PASSIVE_POLICY_BYTE_TIMEOUT = 2.0
 
 
 def _policy_allows_game_socket(policy: bytes, port: int) -> bool:
@@ -253,19 +248,24 @@ class GameSocket:
         self.active_room_id = -1
         self.active_room_name = ""
 
-    async def _drop_tcp_socket(self) -> None:
-        """Close the current TCP socket without treating that as a server failure."""
-        writer = self._writer
-        self._reader = None
-        self._writer = None
-        self._connected = False
-        if writer is None:
-            return
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except Exception:
-            pass
+    async def _read_pushed_policy(self) -> bytes | None:
+        """Read a server-pushed policy. None means the first byte did not arrive."""
+        assert self._reader is not None
+        policy = bytearray()
+        while True:
+            try:
+                chunk = await asyncio.wait_for(
+                    self._reader.readexactly(1), PASSIVE_POLICY_BYTE_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                if policy:
+                    raise
+                return None
+            if chunk[0] == 0:
+                return bytes(policy)
+            policy.append(chunk[0])
+            if len(policy) > 65536:
+                raise ValueError("安全策略过长")
 
     async def connect_tcp(
         self,
@@ -274,23 +274,20 @@ class GameSocket:
         timeout: float = 15.0,
         policy_timeout: float | None = None,
     ) -> bool:
-        """Check the Flash policy, then open a separate socket for game traffic.
+        """Open one game socket and read a pushed policy before login.
 
-        A policy-file request is answered and then closed by the server. Sending
-        the game login on that same socket reads EOF at the length header.
+        This client does not send a policy-file request and does not open a
+        second socket. ``policy_timeout`` is retained for callers and is not a
+        request deadline. A policy that arrives and does not allow the port
+        still stops the connection.
         """
+        del policy_timeout
         try:
             await self._open_tcp(host, port, timeout)
-            wait = bounded_policy_timeout(policy_timeout)
             try:
-                assert self._writer is not None and self._reader is not None
-                self._writer.write(POLICY_FILE_REQUEST)
-                await self._writer.drain()
-                policy = await _read_nul_terminated(self._reader.readexactly, wait)
+                policy = await self._read_pushed_policy()
             except asyncio.TimeoutError:
-                self.disconnect_reason = (
-                    f"TCP 安全策略等待超过 {wait:g} 秒，未收到以空字节结束的策略，已停止连接"
-                )
+                self.disconnect_reason = "TCP 安全策略在空字节前中断，已停止连接"
                 await self.close()
                 print(f"[TCP] Connection failed: {self.disconnect_reason}")
                 return False
@@ -299,23 +296,15 @@ class GameSocket:
                 await self.close()
                 print(f"[TCP] Connection failed: {self.disconnect_reason}")
                 return False
+            if policy is None:
+                print("[TCP] No pushed policy; game login stays on this socket")
+                return True
             if not _policy_allows_game_socket(policy, port):
                 self.disconnect_reason = "TCP 安全策略无效或未允许当前游戏域名及端口，已停止连接"
                 await self.close()
                 print(f"[TCP] Connection failed: {self.disconnect_reason}")
                 return False
-            await self._drop_tcp_socket()
-            try:
-                await self._open_tcp(host, port, timeout)
-            except (OSError, asyncio.TimeoutError) as exc:
-                self.disconnect_reason = (
-                    "策略已允许该端口，但游戏 TCP 未能重新建立："
-                    f"{type(exc).__name__}"
-                )
-                await self.close()
-                print(f"[TCP] Connection failed: {self.disconnect_reason}")
-                return False
-            print(f"[TCP] Policy accepted for port {port}; game socket is separate")
+            print(f"[TCP] Pushed policy accepted for port {port}")
             return True
         except asyncio.IncompleteReadError as e:
             self.disconnect_reason = (
