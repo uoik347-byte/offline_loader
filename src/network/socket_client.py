@@ -158,6 +158,11 @@ def summarize_login_reply(
             False,
         )
     if closed_note:
+        if closed_note.startswith("TCP EOF"):
+            return (
+                f"登录收包时连接已关闭：{closed_note}。这不是等满{wait}秒。",
+                False,
+            )
         return (f"登录收包结束：{closed_note}。等待上限{wait}秒。", False)
     if honor_count:
         return (
@@ -227,6 +232,41 @@ class GameSocket:
     def connected(self) -> bool:
         return self._connected
 
+    async def _open_tcp(self, host: str, port: int, timeout: float) -> None:
+        if self.proxy_url:
+            from src.network.proxy import proxy_socket
+            sock = await proxy_socket(self.proxy_url, host, port, timeout)
+            try:
+                self._reader, self._writer = await asyncio.wait_for(
+                    asyncio.open_connection(sock=sock), timeout=timeout
+                )
+            except BaseException:
+                sock.close()
+                raise
+        else:
+            self._reader, self._writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=timeout
+            )
+        self._connected = True
+        self._use_ws = False
+        self.disconnect_reason = ""
+        self.active_room_id = -1
+        self.active_room_name = ""
+
+    async def _drop_tcp_socket(self) -> None:
+        """Close the current TCP socket without treating that as a server failure."""
+        writer = self._writer
+        self._reader = None
+        self._writer = None
+        self._connected = False
+        if writer is None:
+            return
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
     async def connect_tcp(
         self,
         host: str,
@@ -234,30 +274,16 @@ class GameSocket:
         timeout: float = 15.0,
         policy_timeout: float | None = None,
     ) -> bool:
-        """原始 TCP 连接 (Flash 端口)。先请求并校验跨域策略，不允许则停止。"""
+        """Check the Flash policy, then open a separate socket for game traffic.
+
+        A policy-file request is answered and then closed by the server. Sending
+        the game login on that same socket reads EOF at the length header.
+        """
         try:
-            if self.proxy_url:
-                from src.network.proxy import proxy_socket
-                sock = await proxy_socket(self.proxy_url, host, port, timeout)
-                try:
-                    self._reader, self._writer = await asyncio.wait_for(
-                        asyncio.open_connection(sock=sock), timeout=timeout
-                    )
-                except BaseException:
-                    sock.close()
-                    raise
-            else:
-                self._reader, self._writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, port), timeout=timeout
-                )
-            self._connected = True
-            self._use_ws = False
-            self.disconnect_reason = ""
-            self.active_room_id = -1
-            self.active_room_name = ""
-            print(f"[TCP] Transport established to {host}:{port}")
+            await self._open_tcp(host, port, timeout)
             wait = bounded_policy_timeout(policy_timeout)
             try:
+                assert self._writer is not None and self._reader is not None
                 self._writer.write(POLICY_FILE_REQUEST)
                 await self._writer.drain()
                 policy = await _read_nul_terminated(self._reader.readexactly, wait)
@@ -278,7 +304,18 @@ class GameSocket:
                 await self.close()
                 print(f"[TCP] Connection failed: {self.disconnect_reason}")
                 return False
-            print(f"[TCP] Policy accepted for port {port}")
+            await self._drop_tcp_socket()
+            try:
+                await self._open_tcp(host, port, timeout)
+            except (OSError, asyncio.TimeoutError) as exc:
+                self.disconnect_reason = (
+                    "策略已允许该端口，但游戏 TCP 未能重新建立："
+                    f"{type(exc).__name__}"
+                )
+                await self.close()
+                print(f"[TCP] Connection failed: {self.disconnect_reason}")
+                return False
+            print(f"[TCP] Policy accepted for port {port}; game socket is separate")
             return True
         except asyncio.IncompleteReadError as e:
             self.disconnect_reason = (

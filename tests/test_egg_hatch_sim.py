@@ -1184,39 +1184,145 @@ class SimulatedRoleAndConnectTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bounded_policy_timeout(30), 15.0)
         self.assertTrue(POLICY_FILE_REQUEST.endswith(b"\x00"))
 
-    async def test_simulated_local_policy_exchange_once(self) -> None:
+    async def test_simulated_policy_socket_then_fresh_game_socket(self) -> None:
+        from src.config import MSG_TYPE_SYS, DownCmd
         from src.network.socket_client import POLICY_FILE_REQUEST, GameSocket
+        from src.protocol.message_codec import build_message, pack_utf
 
-        seen = {"request": b"", "connects": 0}
+        first_bytes: list[bytes] = []
+        policy = (
+            '<cross-domain-policy><allow-access-from domain="*" to-ports="*"/>'
+            "</cross-domain-policy>\x00"
+        ).encode()
+        half = len(policy) // 2
 
         async def handle(reader, writer):
-            seen["connects"] += 1
-            seen["request"] = await reader.readuntil(b"\x00")
-            await asyncio.sleep(0.05)
-            port = writer.get_extra_info("sockname")[1]
-            body = (
-                f'<cross-domain-policy><allow-access-from domain="*" to-ports="{port}"/>'
-                f"</cross-domain-policy>\x00"
-            )
-            writer.write(body.encode())
-            await writer.drain()
-            await asyncio.sleep(0.2)
+            try:
+                peeked = await asyncio.wait_for(reader.read(80), timeout=0.6)
+            except TimeoutError:
+                peeked = b""
+            first_bytes.append(peeked)
+            if peeked.startswith(b"<policy-file-request/>"):
+                writer.write(policy[:half])
+                await writer.drain()
+                await asyncio.sleep(0.02)
+                writer.write(policy[half:])
+                await writer.drain()
+            elif peeked:
+                reject = build_message(MSG_TYPE_SYS, DownCmd.logKO, -1, pack_utf("secret-text"))
+                writer.write(struct.pack(">I", len(reject)) + reject)
+                await writer.drain()
+            writer.close()
+
+        import struct
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        socket = GameSocket("simulated-session-value", network_mode="system")
+        try:
+            accepted = await socket.connect_tcp("127.0.0.1", port, timeout=2, policy_timeout=1)
+            self.assertTrue(accepted)
+            self.assertTrue(socket.connected)
+            result = await socket.login("12 依依星", "user-secret", "sid-secret")
+        finally:
+            await socket.close()
+            server.close()
+            await server.wait_closed()
+        self.assertGreaterEqual(len(first_bytes), 2)
+        self.assertEqual(first_bytes[0], POLICY_FILE_REQUEST)
+        self.assertFalse(first_bytes[1].startswith(b"<policy-file-request/>"))
+        self.assertIsNone(result)
+        self.assertTrue(socket.login_explicit_reject)
+        self.assertIn("命令=logKO", socket.last_login_summary)
+        self.assertNotIn("secret-text", socket.last_login_summary)
+        self.assertNotIn("sid-secret", socket.last_login_summary)
+
+    async def test_simulated_game_socket_eof_is_not_a_full_wait(self) -> None:
+        from src.network.socket_client import POLICY_FILE_REQUEST, GameSocket
+
+        async def handle(reader, writer):
+            try:
+                peeked = await asyncio.wait_for(reader.read(80), timeout=0.6)
+            except TimeoutError:
+                peeked = b""
+            if peeked.startswith(POLICY_FILE_REQUEST):
+                writer.write(
+                    b'<cross-domain-policy><allow-access-from domain="*" to-ports="*"/>'
+                    b"</cross-domain-policy>\x00"
+                )
+                await writer.drain()
             writer.close()
 
         server = await asyncio.start_server(handle, "127.0.0.1", 0)
         port = server.sockets[0].getsockname()[1]
         socket = GameSocket("simulated-session-value", network_mode="system")
         try:
-            accepted = await socket.connect_tcp(
-                "127.0.0.1", port, timeout=2, policy_timeout=1
-            )
+            accepted = await socket.connect_tcp("127.0.0.1", port, timeout=2, policy_timeout=1)
             self.assertTrue(accepted)
-            self.assertEqual(seen["request"], POLICY_FILE_REQUEST)
-            self.assertEqual(seen["connects"], 1)
+            result = await socket.login("12 依依星", "user-secret", "sid-secret")
         finally:
             await socket.close()
             server.close()
             await server.wait_closed()
+        self.assertIsNone(result)
+        self.assertFalse(socket.login_explicit_reject)
+        self.assertIn("expected=4, received=0", socket.last_login_summary)
+        self.assertIn("不是等满", socket.last_login_summary)
+        self.assertNotIn("sid-secret", socket.last_login_summary)
+
+    async def test_simulated_partial_login_header_and_denied_policy(self) -> None:
+        from src.network.socket_client import POLICY_FILE_REQUEST, GameSocket
+
+        async def allow_then_partial(reader, writer):
+            try:
+                peeked = await asyncio.wait_for(reader.read(80), timeout=0.6)
+            except TimeoutError:
+                peeked = b""
+            if peeked.startswith(POLICY_FILE_REQUEST):
+                writer.write(
+                    b'<cross-domain-policy><allow-access-from domain="*" to-ports="*"/>'
+                    b"</cross-domain-policy>\x00"
+                )
+                await writer.drain()
+            elif peeked:
+                writer.write(b"\x00\x01")
+                await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_server(allow_then_partial, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        socket = GameSocket("simulated-session-value", network_mode="system")
+        try:
+            self.assertTrue(await socket.connect_tcp("127.0.0.1", port, timeout=2, policy_timeout=1))
+            result = await socket.login("1 测试", "user-secret", "sid-secret")
+        finally:
+            await socket.close()
+            server.close()
+            await server.wait_closed()
+        self.assertIsNone(result)
+        self.assertIn("expected=4, received=2", socket.last_login_summary)
+
+        async def deny(reader, writer):
+            await reader.read(80)
+            writer.write(
+                b'<cross-domain-policy><allow-access-from domain="*" to-ports="1"/>'
+                b"</cross-domain-policy>\x00"
+            )
+            await writer.drain()
+            writer.close()
+
+        denied = await asyncio.start_server(deny, "127.0.0.1", 0)
+        denied_port = denied.sockets[0].getsockname()[1]
+        blocked = GameSocket("simulated-session-value", network_mode="system")
+        try:
+            accepted = await blocked.connect_tcp(
+                "127.0.0.1", denied_port, timeout=2, policy_timeout=1
+            )
+            self.assertFalse(accepted)
+            self.assertIn("未允许", blocked.disconnect_reason)
+        finally:
+            await blocked.close()
+            denied.close()
+            await denied.wait_closed()
 
     def test_simulated_login_summary_separates_reject_timeout_and_parse(self) -> None:
         from src.network.socket_client import summarize_login_reply
