@@ -18,7 +18,9 @@
 /scripts/test_*.py
 !/tests/__init__.py
 !/tests/test_egg_hatch_sim.py
+!/tests/test_egg_user_ui.py
 !/egg_hatch.spec
+!/egg_hatch_user.spec
 !/build_egg_hatch.ps1
 !/docs/egg-hatch-build.txt
 /scripts/verify.py
