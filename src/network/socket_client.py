@@ -45,6 +45,12 @@ _pack_int = pack_int
 logger = logging.getLogger(__name__)
 
 
+# The repository client does not send <policy-file-request/>. It reads a
+# server-pushed policy on the game socket, one byte at a time. This is the
+# initial per-byte wait; a received policy that denies the port still stops.
+PASSIVE_POLICY_BYTE_TIMEOUT = 2.0
+
+
 def _policy_allows_game_socket(policy: bytes, port: int) -> bool:
     try:
         root = ET.fromstring(policy)
@@ -66,6 +72,117 @@ def _policy_allows_game_socket(policy: bytes, port: int) -> bool:
                 if int(bounds[0]) <= port <= int(bounds[1]):
                     return True
     return False
+
+
+async def _read_nul_terminated(readexactly, timeout: float) -> bytes:
+    policy = bytearray()
+    async with asyncio.timeout(timeout):
+        while True:
+            chunk = await readexactly(1)
+            if chunk[0] == 0:
+                return bytes(policy)
+            policy.append(chunk[0])
+            if len(policy) > 65536:
+                raise ValueError("安全策略过长")
+
+
+def _safe_token(value: object, limit: int = 40) -> str:
+    text = "" if value is None else str(value)
+    if not text or len(text) > limit:
+        return ""
+    if not text.isascii():
+        return ""
+    if any(not (char.isalnum() or char in "_=.-") for char in text):
+        return ""
+    return text
+
+
+def _safe_close_note(reason: str) -> str:
+    text = (reason or "").replace("\n", " ").strip()
+    if text.startswith("TCP EOF"):
+        return text[:120]
+    if text.startswith("TCP 收包失败:") or text.startswith("WSS 收包失败:") or text.startswith("发送失败:"):
+        kind = text.split(":", 1)[0]
+        tail = text.split(":", 1)[1].strip().split(":", 1)[0].strip()
+        name = tail if _safe_token(tail, 40) else "异常"
+        return f"{kind}: {name}"
+    if text.startswith("WSS 已关闭:"):
+        code = ""
+        for part in text.replace(",", " ").split():
+            if part.startswith("code="):
+                code = part
+                break
+        return "WSS 已关闭" + (f" {code}" if _safe_token(code.removeprefix("code="), 8) else "")
+    return ""
+
+
+def summarize_login_reply(
+    reply: dict | None,
+    *,
+    body_bytes: int,
+    timed_out: bool,
+    honor_count: int,
+    parse_fail_count: int,
+    parse_fail_bytes: int,
+    parse_fail_type: int | None,
+    closed_note: str,
+    wait_seconds: float,
+) -> tuple[str, bool]:
+    """Classify one game-login observation without copying payload text or ids."""
+    wait = f"{wait_seconds:g}"
+    if isinstance(reply, dict) and reply:
+        command = _safe_token(reply.get("_cmd")) or "无短命令名"
+        action = reply.get("_action")
+        action_text = str(action) if isinstance(action, int) and not isinstance(action, bool) else "无"
+        if reply.get("_cmd") == "logKO":
+            return (
+                f"服务器拒绝游戏登录，命令=logKO，动作={action_text}，"
+                f"正文{body_bytes}字节。不记录拒绝原文。",
+                True,
+            )
+        return (
+            f"收到登录回包但未接受：命令={command}，动作={action_text}，"
+            f"正文{body_bytes}字节，没有正整数 id，也不是 logOK。",
+            False,
+        )
+    if parse_fail_count:
+        type_text = str(parse_fail_type) if parse_fail_type is not None else "无"
+        return (
+            f"登录等待{wait}秒。解析失败{parse_fail_count}次，"
+            f"最后一包{parse_fail_bytes}字节，类型={type_text}。没有可接受的登录回包。",
+            False,
+        )
+    if closed_note:
+        if closed_note.startswith("TCP EOF"):
+            return (
+                f"登录收包时连接已关闭：{closed_note}。这不是等满{wait}秒。",
+                False,
+            )
+        return (f"登录收包结束：{closed_note}。等待上限{wait}秒。", False)
+    if honor_count:
+        return (
+            f"登录等待{wait}秒。只跳过{honor_count}条 honorMsgDispatch，没有登录回包。",
+            False,
+        )
+    if timed_out:
+        return (f"登录等待{wait}秒没有收到回包。", False)
+    if body_bytes:
+        return (f"收到{body_bytes}字节，但不是登录对象。", False)
+    return ("游戏登录没有返回可接受的回包。", False)
+
+
+def endpoint_facts(zone) -> str:
+    domain = str(getattr(zone, "domain", "") or "").strip()
+    host = str(getattr(zone, "host", "") or "").strip()
+    if len(host) > 80:
+        host = host[:80] + "…"
+    if len(domain) > 80:
+        domain = domain[:80] + "…"
+    return (
+        f"server_index={getattr(zone, 'server_index', -1)} "
+        f"host={host or '空'} flash_port={getattr(zone, 'flash_port', 0)} "
+        f"h5_port={getattr(zone, 'port', 0)} domain={domain or '空'}"
+    )
 
 
 class GameSocket:
@@ -97,6 +214,12 @@ class GameSocket:
 
         self.my_user_id = 0
         self.login_response: dict = {}
+        self.last_login_summary = ""
+        self.login_explicit_reject = False
+        self.record_recv_diag = False
+        self._parse_fail_count = 0
+        self._parse_fail_bytes = 0
+        self._parse_fail_type: int | None = None
         self.active_room_id = -1
         self.active_room_name = ""
 
@@ -104,49 +227,84 @@ class GameSocket:
     def connected(self) -> bool:
         return self._connected
 
-    async def connect_tcp(self, host: str, port: int, timeout: float = 15.0) -> bool:
-        """原始 TCP 连接 (Flash 端口)"""
-        try:
-            if self.proxy_url:
-                from src.network.proxy import proxy_socket
-                sock = await proxy_socket(self.proxy_url, host, port, timeout)
-                try:
-                    self._reader, self._writer = await asyncio.wait_for(
-                        asyncio.open_connection(sock=sock), timeout=timeout
-                    )
-                except BaseException:
-                    sock.close()
-                    raise
-            else:
-                self._reader, self._writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, port), timeout=timeout
-                )
-            self._connected = True
-            self._use_ws = False
-            self.disconnect_reason = ""
-            self.active_room_id = -1
-            self.active_room_name = ""
-            print(f"[TCP] Transport established to {host}:{port}")
-            # 读取 Flash 安全策略文件
+    async def _open_tcp(self, host: str, port: int, timeout: float) -> None:
+        if self.proxy_url:
+            from src.network.proxy import proxy_socket
+            sock = await proxy_socket(self.proxy_url, host, port, timeout)
             try:
-                policy = bytearray()
-                async with asyncio.timeout(0.2):
-                    while True:
-                        b = await self._reader.readexactly(1)
-                        if b[0] == 0: break
-                        policy.append(b[0])
-                if not _policy_allows_game_socket(bytes(policy), port):
-                    self.disconnect_reason = "TCP 安全策略无效或未允许当前游戏域名及端口"
-                    await self.close()
-                    print(f"[TCP] Connection failed: {self.disconnect_reason}")
-                    return False
-                print(f"[TCP] Policy: {policy.decode('ascii', errors='replace')[:200]}")
+                self._reader, self._writer = await asyncio.wait_for(
+                    asyncio.open_connection(sock=sock), timeout=timeout
+                )
+            except BaseException:
+                sock.close()
+                raise
+        else:
+            self._reader, self._writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=timeout
+            )
+        self._connected = True
+        self._use_ws = False
+        self.disconnect_reason = ""
+        self.active_room_id = -1
+        self.active_room_name = ""
+
+    async def _read_pushed_policy(self) -> bytes | None:
+        """Read a server-pushed policy. None means the first byte did not arrive."""
+        assert self._reader is not None
+        policy = bytearray()
+        while True:
+            try:
+                chunk = await asyncio.wait_for(
+                    self._reader.readexactly(1), PASSIVE_POLICY_BYTE_TIMEOUT
+                )
             except asyncio.TimeoutError:
-                self.disconnect_reason = "TCP 安全策略等待超过 0.2 秒"
+                if policy:
+                    raise
+                return None
+            if chunk[0] == 0:
+                return bytes(policy)
+            policy.append(chunk[0])
+            if len(policy) > 65536:
+                raise ValueError("安全策略过长")
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float = 15.0,
+        policy_timeout: float | None = None,
+    ) -> bool:
+        """Open one game socket and read a pushed policy before login.
+
+        This client does not send a policy-file request and does not open a
+        second socket. ``policy_timeout`` is retained for callers and is not a
+        request deadline. A policy that arrives and does not allow the port
+        still stops the connection.
+        """
+        del policy_timeout
+        try:
+            await self._open_tcp(host, port, timeout)
+            try:
+                policy = await self._read_pushed_policy()
+            except asyncio.TimeoutError:
+                self.disconnect_reason = "TCP 安全策略在空字节前中断，已停止连接"
                 await self.close()
                 print(f"[TCP] Connection failed: {self.disconnect_reason}")
                 return False
-            print(f"[TCP] Connected to {host}:{port}")
+            except ValueError:
+                self.disconnect_reason = "TCP 安全策略无效或过长，已停止连接"
+                await self.close()
+                print(f"[TCP] Connection failed: {self.disconnect_reason}")
+                return False
+            if policy is None:
+                print("[TCP] No pushed policy; game login stays on this socket")
+                return True
+            if not _policy_allows_game_socket(policy, port):
+                self.disconnect_reason = "TCP 安全策略无效或未允许当前游戏域名及端口，已停止连接"
+                await self.close()
+                print(f"[TCP] Connection failed: {self.disconnect_reason}")
+                return False
+            print(f"[TCP] Pushed policy accepted for port {port}")
             return True
         except asyncio.IncompleteReadError as e:
             self.disconnect_reason = (
@@ -439,11 +597,15 @@ class GameSocket:
             try:
                 message = self._decode_server_body(bytes(body_raw))
             except (ValueError, EOFError, IndexError, struct.error) as exc:
+                if self.record_recv_diag:
+                    self._parse_fail_count += 1
+                    self._parse_fail_bytes = len(body_raw)
+                    self._parse_fail_type = body_raw[0]
                 logger.warning(
                     "server packet parse failed: bytes=%d, type=%d, error=%s",
                     len(body_raw),
                     body_raw[0],
-                    exc,
+                    type(exc).__name__,
                 )
                 continue
             return (message, bytes(body_raw))
@@ -568,39 +730,54 @@ class GameSocket:
         发送登录包并接收响应
         """
         packet = build_login_message(zone, user_id, session_id)
-        print(f"[LOGIN] Sending packet: {len(packet)} bytes")
-        print(f"[LOGIN] Header: type={MSG_TYPE_SYS} action={UpCmd.Login} roomId=-1")
-        print(f"[LOGIN] Zone: {zone}")
-        print(f"[LOGIN] UserId: {user_id}")
-        print(f"[LOGIN] Credential loaded (len={len(session_id)})")
+        print(f"[LOGIN] Sending packet: {len(packet)} bytes, zone_bytes={len(zone.encode('utf-8'))}")
         await self._send_raw(packet)
-
-        deadline = asyncio.get_running_loop().time() + 15.0
-        while True:
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                resp, raw = None, None
-                break
-            resp, raw = await self._recv_any_packet(timeout=remaining)
-            if not isinstance(resp, dict) or resp.get('_cmd') != 'honorMsgDispatch':
-                break
-            print("[LOGIN] Honor notification received; waiting for login response")
-        if resp is None and raw is None:
-            print("[LOGIN] No response (timeout)")
+        self.login_explicit_reject = False
+        self._parse_fail_count = 0
+        self._parse_fail_bytes = 0
+        self._parse_fail_type = None
+        self.record_recv_diag = True
+        honor_count = 0
+        wait_seconds = 15.0
+        resp, raw = None, None
+        try:
+            deadline = asyncio.get_running_loop().time() + wait_seconds
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    resp, raw = None, None
+                    break
+                resp, raw = await self._recv_any_packet(timeout=remaining)
+                if not isinstance(resp, dict) or resp.get("_cmd") != "honorMsgDispatch":
+                    break
+                honor_count += 1
+        finally:
+            self.record_recv_diag = False
+        summary, explicit = summarize_login_reply(
+            resp if isinstance(resp, dict) else None,
+            body_bytes=len(raw) if isinstance(raw, (bytes, bytearray)) else 0,
+            timed_out=resp is None and raw is None and not self.disconnect_reason,
+            honor_count=honor_count,
+            parse_fail_count=self._parse_fail_count,
+            parse_fail_bytes=self._parse_fail_bytes,
+            parse_fail_type=self._parse_fail_type,
+            closed_note=_safe_close_note(self.disconnect_reason),
+            wait_seconds=wait_seconds,
+        )
+        self.last_login_summary = summary
+        self.login_explicit_reject = explicit
+        if not isinstance(resp, dict) or not resp:
             return None
-        if raw:
-            print(f"[LOGIN] Raw body {len(raw)} bytes")
-
-        if isinstance(resp, dict) and resp:
-            self.login_response = dict(resp)
-            uid = resp.get('id')
-            if uid is not None:
-                self.my_user_id = int(uid) if not isinstance(uid, int) else uid
-            print(f"[LOGIN] id={self.my_user_id}, cmd={resp.get('_cmd','?')}")
-            if self.my_user_id > 0:
-                return resp
-            if resp.get('_cmd') == 'logOK':
-                return resp
+        self.login_response = dict(resp)
+        uid = resp.get("id")
+        if uid is not None and not isinstance(uid, bool):
+            try:
+                self.my_user_id = uid if isinstance(uid, int) else int(uid)
+            except (TypeError, ValueError):
+                self.my_user_id = 0
+        if self.my_user_id > 0 or resp.get("_cmd") == "logOK":
+            self.login_explicit_reject = False
+            return resp
         return None
     # ── 发送扩展消息 ──
 
@@ -743,47 +920,115 @@ async def _connect_tcp_with_retry(sock, host, port, timeout, window):
     return False
 
 
+def _remember_stage(stage_notes: list[str] | None, text: str) -> None:
+    if stage_notes is None:
+        return
+    cleaned = text.replace("\n", " ").strip()
+    lowered = cleaned.lower()
+    for marker in ("password", "session_id", "session", "cookie", "token", "sid"):
+        start = lowered.find(marker)
+        if start >= 0:
+            cleaned = cleaned[:start] + "[REDACTED]"
+            break
+    if len(cleaned) > 180:
+        cleaned = cleaned[:180] + "…"
+    stage_notes.append(cleaned)
+
+
 async def login_and_connect(
     zone, user_id: str, session_id: str,
     timeout: float = 15.0,
     proxy_url: str | None = None,
     network_mode: str = "legacy",
     tcp_retry_window: float | None = None,
+    stage_notes: list[str] | None = None,
+    policy_timeout: float | None = None,
 ) -> GameSocket | None:
-    """TCP/WSS login; a retry window selects TCP only and retries before sending login."""
+    """TCP/WSS login; a retry window selects TCP only and retries before sending login.
+
+    The socket login packet is zone, user id and session id. It does not resend charId.
+    ``stage_notes`` receives short stage results and must stay free of credentials.
+    """
     if network_mode == "system":
         sock = GameSocket(session_id, network_mode="system")
     else:
         sock = GameSocket(session_id, proxy_url=proxy_url) if proxy_url else GameSocket(session_id)
     retained = False
+    zone_label = f"{zone.zone_index} {zone.zone_name}"
     try:
-        # 策略 2: 原始 TCP (Flash port)
+        # 策略 2: 原始 TCP (Flash port)。flash 端口为 0 时才退到 H5 端口。
         tcp_port = zone.flash_port or zone.port
-        connected = (await _connect_tcp_with_retry(sock, zone.host, tcp_port, timeout, tcp_retry_window)
-                     if tcp_retry_window is not None else await sock.connect_tcp(zone.host, tcp_port, timeout))
-        if connected:
-            resp = await sock.login(
-                f"{zone.zone_index} {zone.zone_name}",
-                user_id, session_id
+        if not zone.host or tcp_port <= 0:
+            connected = False
+            _remember_stage(stage_notes, "Flash TCP 未尝试：区服没有 host 或端口")
+        else:
+            connected = (
+                await _connect_tcp_with_retry(sock, zone.host, tcp_port, timeout, tcp_retry_window)
+                if tcp_retry_window is not None
+                else await sock.connect_tcp(
+                    zone.host, tcp_port, timeout, policy_timeout=policy_timeout
+                )
             )
-            if resp is not None and (tcp_retry_window is None or resp.get('_cmd') == 'logOK'):
+            if not connected:
+                _remember_stage(
+                    stage_notes,
+                    "Flash TCP 未连上："
+                    + (sock.disconnect_reason or "无断开说明")
+                    + "。"
+                    + endpoint_facts(zone),
+                )
+        if connected:
+            resp = await sock.login(zone_label, user_id, session_id)
+            accepted = resp is not None and (
+                tcp_retry_window is None or resp.get("_cmd") == "logOK"
+            )
+            if accepted:
                 retained = True
+                _remember_stage(stage_notes, "Flash TCP 游戏登录已接受")
                 return sock
+            if resp is None:
+                _remember_stage(
+                    stage_notes,
+                    "Flash TCP 已连上，" + (sock.last_login_summary or "游戏登录没有返回可接受的回包"),
+                )
+                if sock.login_explicit_reject:
+                    _remember_stage(stage_notes, "已收到明确拒绝，不再尝试 H5 WebSocket")
+                    return None
+            else:
+                command = str(resp.get("_cmd", ""))
+                _remember_stage(
+                    stage_notes,
+                    f"Flash TCP 已连上，回包命令不是 logOK（cmd={command}），这条连接已放弃",
+                )
             await sock.close()
 
         if tcp_retry_window is not None:
+            _remember_stage(stage_notes, "已跳过 H5 WebSocket：本次指定了只重试 Flash TCP")
             return None
 
         # 策略 1: WebSocket (H5 domain:port)
-        if zone.domain and zone.port > 0:
-            if await sock.connect_ws(zone.domain, zone.port, timeout):
-                resp = await sock.login(
-                    f"{zone.zone_index} {zone.zone_name}",
-                    user_id, session_id
-                )
-                if resp is not None:
-                    retained = True
-                    return sock
+        if not (zone.domain and zone.port > 0):
+            _remember_stage(
+                stage_notes,
+                "H5 WebSocket 未尝试：解析结果没有同时具备 domain 和 h5 端口。"
+                + endpoint_facts(zone),
+            )
+            return None
+        if not await sock.connect_ws(zone.domain, zone.port, timeout):
+            _remember_stage(
+                stage_notes,
+                "H5 WebSocket 未连上：" + (sock.disconnect_reason or "无断开说明"),
+            )
+            return None
+        resp = await sock.login(zone_label, user_id, session_id)
+        if resp is not None:
+            retained = True
+            _remember_stage(stage_notes, "H5 WebSocket 游戏登录已接受")
+            return sock
+        _remember_stage(
+            stage_notes,
+            "H5 WebSocket 已连上，" + (sock.last_login_summary or "游戏登录没有返回可接受的回包"),
+        )
         return None
     finally:
         if not retained:

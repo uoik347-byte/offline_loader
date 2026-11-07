@@ -29,16 +29,41 @@ class ServerEndpoint:
 
 
 def parse_server_list(text: str) -> list[ServerEndpoint]:
-    servers = []
-    for index, entry in enumerate(text.split(";")):
-        parts = entry.strip().split(":")
+    servers, _summary = parse_server_list_report(text)
+    return servers
+
+
+def parse_server_list_report(text: str) -> tuple[list[ServerEndpoint], str]:
+    """Parse ``host:flash端口:h5端口:domain``. Other colon counts are counted and ignored."""
+    servers: list[ServerEndpoint] = []
+    field_counts: dict[int, int] = {}
+    bad_ports = 0
+    for index, raw in enumerate(text.split(";")):
+        entry = raw.strip()
+        if not entry:
+            continue
+        parts = entry.split(":")
+        field_counts[len(parts)] = field_counts.get(len(parts), 0) + 1
         if len(parts) != 4:
             continue
         try:
-            servers.append(ServerEndpoint(index, parts[0], int(parts[1]), int(parts[2]), parts[3]))
+            flash_port = int(parts[1])
+            h5_port = int(parts[2])
         except ValueError:
+            bad_ports += 1
             continue
-    return servers
+        servers.append(ServerEndpoint(index, parts[0], flash_port, h5_port, parts[3]))
+    summary = [f"接受 host:flash端口:h5端口:domain 共 {len(servers)} 条"]
+    skipped = [
+        f"{count} 字段 {field_counts[count]} 条"
+        for count in sorted(field_counts)
+        if count != 4
+    ]
+    if skipped:
+        summary.append("未按该四段格式忽略 " + "、".join(skipped))
+    if bad_ports:
+        summary.append(f"端口不是整数 {bad_ports} 条")
+    return servers, "；".join(summary)
 
 
 @dataclass
@@ -65,6 +90,7 @@ class LoginResult:
     error_msg: str = ""
     blocked_reason: str = ""
     server_list: list[ServerEndpoint] = field(default_factory=list)
+    server_parse_summary: str = ""
     http_stage: str = ""
     http_status: int | None = None
 
@@ -188,7 +214,7 @@ def parse_login_response(xml_text: str) -> LoginResult:
         svr_text = _get_element_text(root, "svr")
         zn_text = _get_element_text(root, "zn")
 
-        server_list = parse_server_list(svr_text)
+        server_list, server_parse_summary = parse_server_list_report(svr_text)
         servers_by_index = {server.server_index: server for server in server_list}
         zone_info_list = [z for z in zn_text.split(";") if z.strip()]
 
@@ -230,6 +256,7 @@ def parse_login_response(xml_text: str) -> LoginResult:
             session_id=session_id,
             zone_list=zone_list,
             server_list=server_list,
+            server_parse_summary=server_parse_summary,
         )
     except ET.ParseError as e:
         return LoginResult(success=False, error_msg=f"XML parse error: {e}")
@@ -303,6 +330,53 @@ def _save_login_failure(stage, request_url, response, body, error, account, pass
     return f"{redact(error)}；{analysis}；诊断文件：{metadata_path}"
 
 
+async def query_roles(
+    account: str,
+    *,
+    register_url: Optional[str] = None,
+    timeout: Optional[float] = None,
+    network_mode: str = "system",
+) -> list[RoleInfo]:
+    """Look up roles with the account id only. This does not send or check a password."""
+    if not isinstance(account, str) or not account.strip():
+        raise ValueError("请填写账号")
+    account = account.strip()
+    conf = {} if network_mode == "system" else load_user_config()
+    if register_url is None:
+        register_url = conf.get("register_url", default_config()["register_url"])
+    request_timeout = aiohttp.ClientTimeout(
+        total=float(timeout if timeout is not None else conf.get("timeout", 30))
+    )
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Origin": "https://aola.100bt.com",
+        "Referer": "https://aola.100bt.com/",
+    }
+    from src.network.proxy import process_proxy, proxy_connector
+    effective_proxy = None if network_mode == "system" else process_proxy()
+    session_options = {"connector": proxy_connector(effective_proxy)} if effective_proxy else {}
+    if network_mode == "system":
+        session_options["trust_env"] = False
+    try:
+        async with aiohttp.ClientSession(**session_options) as session:
+            async with session.post(
+                register_url,
+                data=urllib.parse.urlencode({"type": "query_role_info", "duoduoId": account}),
+                headers=headers,
+                timeout=request_timeout,
+            ) as response:
+                body = await response.read()
+                response.raise_for_status()
+                text = body.decode("utf-8", errors="replace")
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        raise ConnectionError(f"角色查询请求失败：{type(exc).__name__}") from exc
+    try:
+        return parse_role_response(text)
+    except ValueError as exc:
+        raise ConnectionError(f"角色查询结果无法识别：{exc}") from exc
+
+
 async def http_login(
     account: str,
     password: str,
@@ -314,6 +388,7 @@ async def http_login(
     proxy_url: Optional[str] = None,
     network_mode: str = "legacy",
     diagnostic_dir: Optional[str] = None,
+    save_diagnostics: bool = True,
 ) -> LoginResult:
     """Query the configured role and return the selected role's login result."""
     conf = {} if network_mode == "system" else load_user_config()
@@ -379,10 +454,11 @@ async def http_login(
             result.blocked_reason = f"HTTP {status}：服务器拒绝继续登录"
         elif is_captcha_page(response_body.decode("utf-8", errors="replace")):
             result.blocked_reason = "登录需要人机验证"
-        result.error_msg = _save_login_failure(
-            stage, request_url, response, response_body, result.error_msg, account, password,
-            **({"diagnostic_dir": diagnostic_dir} if diagnostic_dir is not None else {}),
-        )
+        if save_diagnostics:
+            result.error_msg = _save_login_failure(
+                stage, request_url, response, response_body, result.error_msg, account, password,
+                **({"diagnostic_dir": diagnostic_dir} if diagnostic_dir is not None else {}),
+            )
         if browser_verification and is_captcha_page(response_body.decode("utf-8", errors="replace")):
             if effective_proxy:
                 return result  # The headless worker must not open a direct browser.
