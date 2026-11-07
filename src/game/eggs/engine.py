@@ -97,21 +97,22 @@ class EggEngine:
         self.on_board = lambda _text: None
         if hasattr(transport, "allow_command"):
             transport.allow_command = self._allow_command
+        self._in_run = False
         if hasattr(transport, "should_stop"):
-            transport.should_stop = lambda: self.abort_requested
+            transport.should_stop = lambda: self.stop_requested or self.abort_requested
 
     def begin(self) -> None:
+        """Drop a finished stop so the next explicit action is not cancelled."""
         self.draining = False
         self.abort_requested = False
         self.stop_requested = False
 
     def request_stop(self) -> None:
-        if self.abort_requested or self.draining:
+        if self.stop_requested:
             return
-        self.draining = True
+        self.draining = False
         self.stop_requested = True
-        self.log("已停止孵化。将收取已经孵化完成的亚比，并等待已提交的蛋就绪。")
-        self._publish_board()
+        self.log("已按下停止。不再发送新的孵化或收取。已经写出的指令无法撤回。")
 
     def request_abort(self) -> None:
         if self.abort_requested:
@@ -121,10 +122,8 @@ class EggEngine:
         self.log("已断开或关闭，停止收取。蛋留在游戏中。")
 
     def _allow_command(self, _ext_id: int, cmd: str) -> bool:
-        if self.abort_requested:
+        if self.abort_requested or self.stop_requested:
             return False
-        if cmd == CMD_HATCH:
-            return not self.draining
         return True
 
     def board_text(self) -> str:
@@ -145,8 +144,6 @@ class EggEngine:
         status = await self._fetch_status()
         if not status.ok:
             return status
-        if self.stop_requested:
-            return QueryView(False, "stopped", "已停止，未继续查询未孵化蛋", status.pending, None)
         unhatched = await self._fetch_unhatched()
         if not unhatched.ok:
             return QueryView(
@@ -172,10 +169,19 @@ class EggEngine:
             return self._report(False, "confirmation", "没有确认，不发送孵化或收取")
         if not self.store.ok:
             return self._report(False, "store", self.store.error)
+        self._in_run = True
+        self.stop_requested = False
+        self.draining = False
+        try:
+            return await self._run_body(retry_uncertain_collect=retry_uncertain_collect)
+        finally:
+            self._in_run = False
+            self.stop_requested = False
+            self.draining = False
+
+    async def _run_body(self, *, retry_uncertain_collect: bool) -> RunReport:
         if self.abort_requested:
-            return self._not_cleared()
-        if self.draining:
-            return await self._drain()
+            return self._report(False, "stopped", "已断开，没有发送", stopped=True)
         if retry_uncertain_collect:
             self.log("已允许对仍在列表中的蛋再收取一次。已提交的孵化不会重发。")
             self.store.clear_collect_blocks()
@@ -186,7 +192,7 @@ class EggEngine:
         self.log(view.detail)
         while True:
             if self.stop_requested:
-                return await self._on_stop()
+                return self._stopped_report()
             ready = self._ready_record()
             if ready is not None:
                 outcome = await self._collect(ready)
@@ -198,14 +204,14 @@ class EggEngine:
                     outcome = await self._refresh_once()
                     if outcome != "ok":
                         if self.stop_requested or outcome == "stopped":
-                            return await self._on_stop()
+                            return self._stopped_report()
                         return self._finish_outcome(outcome)
                     if self.stop_requested:
-                        return await self._on_stop()
+                        return self._stopped_report()
                     if self._ready_record() is not None:
                         continue
                     if not await self._sleep_poll():
-                        return await self._on_stop()
+                        return self._stopped_report()
                     continue
                 self._freeze_unmapped()
                 self.log("服务器列表里仍有无法对应到孵化格的蛋，不再提交新的孵化。")
@@ -215,14 +221,14 @@ class EggEngine:
                     outcome = await self._refresh_once()
                     if outcome != "ok":
                         if self.stop_requested or outcome == "stopped":
-                            return await self._on_stop()
+                            return self._stopped_report()
                         return self._finish_outcome(outcome)
                     if self.stop_requested:
-                        return await self._on_stop()
+                        return self._stopped_report()
                     if self._ready_record() is not None:
                         continue
                     if not await self._sleep_poll():
-                        return await self._on_stop()
+                        return self._stopped_report()
                     continue
                 self._freeze_local()
                 continue
@@ -233,8 +239,8 @@ class EggEngine:
                 self.log(detail)
                 return self._report(True, "idle", detail)
             outcome = await self._hatch(egg_id, slot)
-            if self.stop_requested or self.draining or self.abort_requested:
-                return await self._on_stop()
+            if self.stop_requested or self.abort_requested:
+                return self._stopped_report()
             if outcome == "accepted":
                 self._ensure_watch(egg_id)
                 continue
@@ -318,38 +324,37 @@ class EggEngine:
             self.store.upsert(record)
 
     def _note_fresh(self, pending: list[PendingEgg]) -> None:
-        """A successful 1-8 is the only list that may be collected."""
+        """A successful 1-8 is the incubator. Absent history is not a current egg."""
         self._fresh = True
         self._fresh_pending = list(pending)
         self._fresh_ids = {egg.egg_id for egg in pending}
-        live = self._fresh_ids
         for egg_id, record in list(self.store.records.items()):
-            if egg_id in live:
-                continue
-            if self._keep_off_list(record):
-                if record.get("st") == READY_ST and not record.get("collect_blocked"):
-                    record["st"] = None
-                    if record.get("phase") == "ready":
-                        record["phase"] = "hatching"
+            if egg_id in self._fresh_ids:
+                if record.get("phase") == "audit_absent":
+                    record["phase"] = "server"
                     self.store.upsert(record)
+                continue
+            phase = record.get("phase")
+            if phase in {"hatch_inflight", "collect_inflight"}:
+                continue
+            if (
+                record.get("hatch_sent")
+                and record.get("slot") in SLOT_IDS
+                and phase in {"hatching", "readiness_timeout", "hatch_uncertain"}
+            ):
+                if record.get("st") == READY_ST:
+                    record["st"] = None
+                    self.store.upsert(record)
+                continue
+            if phase in {"collect_uncertain", "collect_inflight"} or record.get("collect_blocked"):
+                record["phase"] = "audit_absent"
+                record["st"] = None
+                record["slot"] = None
+                record["collect_blocked"] = True
+                self.store.upsert(record)
                 continue
             self.store.remove(egg_id)
         self._publish_board()
-
-    def _keep_off_list(self, record: dict) -> bool:
-        phase = record.get("phase")
-        if record.get("collect_blocked") or phase in {
-            "hatch_inflight",
-            "collect_inflight",
-            "hatch_uncertain",
-            "collect_uncertain",
-        }:
-            return True
-        return bool(
-            record.get("hatch_sent")
-            and record.get("slot") in SLOT_IDS
-            and phase in {"hatching", "readiness_timeout"}
-        )
 
     def _uncertain_pending(self) -> bool:
         return any(
@@ -378,11 +383,16 @@ class EggEngine:
         return dict(ready[0]) if ready else None
 
     def _unmapped(self) -> list[dict]:
-        return [
-            record
-            for record in self.store.records.values()
-            if record.get("slot") is None
-        ]
+        rows = []
+        for record in self.store.records.values():
+            if record.get("slot") is not None:
+                continue
+            if record.get("phase") == "audit_absent":
+                continue
+            if self._fresh and record.get("egg_id") not in self._fresh_ids:
+                continue
+            rows.append(record)
+        return rows
 
     def _waiting_unmapped(self) -> bool:
         waiting = [
@@ -459,7 +469,7 @@ class EggEngine:
         return await self.clock.sleep(self.limits.poll_interval, lambda: self.stop_requested)
 
     async def _hatch(self, egg_id: int, slot: int) -> str:
-        if self.draining or self.abort_requested:
+        if self.stop_requested or self.abort_requested:
             self._queue.insert(0, egg_id)
             return "stopped"
         self.store.upsert(
@@ -521,8 +531,8 @@ class EggEngine:
         return "accepted"
 
     async def _collect(self, record: dict) -> str:
-        if self.abort_requested:
-            return "abort"
+        if self.stop_requested or self.abort_requested:
+            return "stopped"
         egg_id = int(record["egg_id"])
         pmid = int(record["pmid"])
         if not self._fresh or egg_id not in self._fresh_ids:
@@ -604,50 +614,55 @@ class EggEngine:
             }
         )
 
-    async def _on_stop(self) -> RunReport:
-        if self.abort_requested:
-            return self._not_cleared()
-        if self.draining:
-            return await self._drain()
-        return self._report(True, "stopped", "已停止。已提交的蛋仍留在游戏中。", stopped=True)
+    def _stopped_report(self) -> RunReport:
+        detail = "已停止。不再发送新的孵化或收取。已经写出的指令无法撤回。"
+        self.log(detail)
+        return self._report(True, "stopped", detail, stopped=True)
 
-    async def _drain(self) -> RunReport:
-        while True:
-            if self.abort_requested:
-                return self._not_cleared()
+    async def collect_ready(self, *, confirmed: bool, retry_uncertain_collect: bool = False) -> RunReport:
+        """Collect only eggs that a fresh 1-8 lists as ready. Do not hatch or wait."""
+        self._open()
+        if not confirmed:
+            self.log("没有确认，不发送收取。")
+            return self._report(False, "confirmation", "没有确认，不发送收取")
+        if self._in_run:
+            return self._report(False, "busy", "已有操作在进行，没有发送收取")
+        self._in_run = True
+        self.stop_requested = False
+        collected: list[int] = []
+        try:
+            if retry_uncertain_collect:
+                self.log("已允许对仍在最新列表中的蛋再收取一次。")
+                self.store.clear_collect_blocks()
             status = await self._fetch_status()
             if not status.ok or status.pending is None:
-                return self._not_cleared()
-            pending = list(status.pending)
+                self.log(status.detail)
+                return self._report(False, status.kind, status.detail)
+            if self.stop_requested:
+                return self._stopped_report()
             ready = [
-                egg for egg in pending
+                egg for egg in status.pending
                 if egg.st == READY_ST and egg.pmid > 0 and not self._blocked(egg.egg_id, egg.pmid)
             ]
             ready.sort(key=lambda egg: egg.egg_id)
-            if ready:
-                outcome = await self._collect(self._server_record(ready[0]))
-                if outcome != "collected":
-                    return self._not_cleared()
-                continue
-            if any(egg.st is None for egg in pending) or self._uncertain_pending():
-                return self._not_cleared()
-            waiting_ids = [egg.egg_id for egg in pending if egg.st != READY_ST]
-            for record in self.store.records.values():
-                if (
-                    record.get("hatch_sent")
-                    and record.get("slot") in SLOT_IDS
-                    and record.get("phase") == "hatching"
-                    and record["egg_id"] not in self._fresh_ids
-                ):
-                    waiting_ids.append(record["egg_id"])
-            if not waiting_ids:
-                return self._cleared()
-            for egg_id in waiting_ids:
-                self._ensure_watch(egg_id)
-            if all(self._overdue(egg_id) for egg_id in waiting_ids):
-                return self._not_cleared()
-            if not await self.clock.sleep(self.limits.poll_interval, lambda: self.abort_requested):
-                return self._not_cleared()
+            if not ready:
+                detail = "最新 1-8 里没有可收取的蛋。没有孵化，也没有等待未就绪的蛋。"
+                self.log(detail)
+                return self._report(True, "idle", detail)
+            for egg in ready:
+                if self.stop_requested:
+                    return self._stopped_report()
+                outcome = await self._collect(self._server_record(egg))
+                if outcome == "collected":
+                    collected.append(egg.egg_id)
+                    continue
+                return self._finish_outcome(outcome)
+            detail = f"已收取 {len(collected)} 个当前就绪的蛋。没有孵化，也没有等待未就绪的蛋。"
+            self.log(detail)
+            return self._report(True, "collected", detail)
+        finally:
+            self._in_run = False
+            self.stop_requested = False
 
     def _blocked(self, egg_id: int, pmid: int) -> bool:
         record = self.store.get(egg_id)
@@ -667,18 +682,6 @@ class EggEngine:
             "hatch_sent": bool(current.get("hatch_sent")),
             "collect_blocked": False,
         }
-
-    def _cleared(self) -> RunReport:
-        detail = "已彻底停止，格子已空。"
-        self.log(detail)
-        self._publish_board()
-        return self._report(True, "cleared", detail, stopped=True)
-
-    def _not_cleared(self) -> RunReport:
-        detail = "已停止提交，未确认清空，仍有蛋留在游戏中。"
-        self.log(detail)
-        self._publish_board()
-        return self._report(True, "not_cleared", detail, stopped=True)
 
     def _finish_outcome(self, outcome: str) -> RunReport:
         detail = {

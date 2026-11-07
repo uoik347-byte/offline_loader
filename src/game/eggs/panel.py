@@ -21,11 +21,11 @@ def format_incubators(store, pending, *, fresh: bool) -> str:
     listed = {egg.egg_id: egg for egg in pending or []}
     lines = ["孵化器（只显示本机这次提交成功的格子）"]
     if not fresh:
-        lines.append("列表未知，不能把三个格子当成空的。")
+        lines.append("列表未知，三个格子都标为未知，不是空的。")
     for slot in SLOT_IDS:
         record = by_slot.get(slot)
         if record is None:
-            lines.append(f"格 {slot}：空")
+            lines.append(f"格 {slot}：未知" if not fresh else f"格 {slot}：空")
             continue
         egg = listed.get(record["egg_id"])
         status = egg.st if egg is not None else record.get("st")

@@ -1,6 +1,7 @@
 """Local slot and uncertain-action memory. No account secrets are stored."""
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -16,6 +17,7 @@ HOLD_PHASES = frozenset(
         "ready",
         "collect_inflight",
         "collect_uncertain",
+        "audit_absent",
     }
 )
 class StoreError(ValueError):
@@ -59,7 +61,7 @@ class HoldStore:
         for item in self.records.values():
             if item.get("collect_blocked"):
                 item["collect_blocked"] = False
-                if item.get("phase") in {"collect_inflight", "collect_uncertain"}:
+                if item.get("phase") in {"collect_inflight", "collect_uncertain", "audit_absent"}:
                     item["phase"] = "ready"
         self.save()
 
@@ -123,6 +125,17 @@ class JsonHoldStore(HoldStore):
         self.records = records
         self.ok = True
         self.error = ""
+
+    def bind_scope(self, account: str, char_id: int) -> None:
+        """Separate one character's notes from another's. The path is only a hash."""
+        digest = hashlib.sha256(
+            f"{account.strip()}\n{int(char_id)}".encode("utf-8")
+        ).hexdigest()[:16]
+        scoped = self.path.parent / f"egg-hatch-state-{digest}.json"
+        if scoped == self.path:
+            return
+        self.path = scoped
+        self.load()
 
     def save(self) -> None:
         if not self.ok:

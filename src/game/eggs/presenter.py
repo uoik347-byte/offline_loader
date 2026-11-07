@@ -17,12 +17,25 @@ def confirmation_text(query: QueryView, store: HoldStore, retry_uncertain_collec
     return (
         "开始后会向当前已连接的游戏服务器发送孵化（1-4）和收取（1223）。\n"
         f"最近一次查询：待处理 {pending} 个，未孵化 {unhatched} 个，本机占用记录 {held} 条。\n"
-        "点“停止并收取”后不再孵化新的蛋。已经可收取的会收取；"
-        "已经提交、尚未就绪的，只在现有时限内等待就绪后再收取。"
-        "只有新的 1-8 确认是空的，才会显示格子已空。\n"
+        "停止后不再发送新的孵化或收取。已经写出的指令无法撤回。\n"
         f"这次{retry}重试上次结果不确定的收取。已经提交过的孵化不会重发。\n"
         "重新打开程序不会自动继续。\n"
         "确定开始吗？"
+    )
+
+
+def collect_confirmation_text(query: QueryView | None, retry_uncertain_collect: bool) -> str:
+    ready = 0
+    if query is not None and query.pending is not None:
+        ready = sum(1 for egg in query.pending if getattr(egg, "st", None) == 100)
+    retry = "会" if retry_uncertain_collect else "不会"
+    listed = "最近一次查询里可收取约 " + str(ready) + " 个。" if query and query.ok else "将以确定后新查到的 1-8 为准。"
+    return (
+        "收取只查询当前 1-8，并收取其中 st=100 的蛋。\n"
+        "不会孵化，也不会等待还没就绪的蛋。\n"
+        f"{listed}\n"
+        f"这次{retry}重试上次结果不确定、且这次列表里仍然存在的蛋。\n"
+        "列表未知时不会发送。确定收取吗？"
     )
 
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -10,7 +11,7 @@ from tkinter import messagebox, ttk
 from src.config import PROJECT_ROOT
 from src.game.eggs.engine import EggEngine
 from src.game.eggs.panel import format_incubators
-from src.game.eggs.presenter import can_start, confirmation_text, format_board
+from src.game.eggs.presenter import can_start, collect_confirmation_text, confirmation_text, format_board
 from src.game.eggs.protocol import public_error
 from src.game.eggs.session import CancelledStep, EggSession, format_zone_choice
 from src.game.eggs.store import JsonHoldStore
@@ -21,7 +22,8 @@ class EggApp:
     def __init__(self, root: tk.Tk, store_path: Path | None = None, log_path: Path | None = None) -> None:
         self.root = root
         self.root.title("亚比蛋孵化收取")
-        self.root.geometry("820x680")
+        self.root.geometry("920x820")
+        self.root.minsize(760, 680)
         self.session = EggSession()
         self.store = JsonHoldStore(store_path or (PROJECT_ROOT / "egg-hatch-local-state.json"))
         self._roles: list[tuple[int, str]] = []
@@ -76,17 +78,21 @@ class EggApp:
         self.cancel_button.pack(side=tk.LEFT, padx=(0, 6))
         self.disconnect_button.pack(side=tk.LEFT)
 
-        work = ttk.LabelFrame(frame, text="蛋", padding=8)
-        work.pack(fill=tk.BOTH, expand=True, pady=8)
+        paned = ttk.Panedwindow(frame, orient=tk.VERTICAL)
+        paned.pack(fill=tk.BOTH, expand=True, pady=8)
+        work = ttk.LabelFrame(paned, text="蛋", padding=8)
+        paned.add(work, weight=3)
         actions = ttk.Frame(work)
         actions.pack(fill=tk.X)
         self.query_button = ttk.Button(actions, text="查询列表", command=self._on_query)
         self.start_button = ttk.Button(actions, text="开始", command=self._on_start)
-        self.stop_button = ttk.Button(actions, text="停止并收取", command=self._on_stop)
+        self.stop_button = ttk.Button(actions, text="停止", command=self._on_stop)
+        self.collect_button = ttk.Button(actions, text="收取", command=self._on_collect)
         self.clear_button = ttk.Button(actions, text="确认格子已空", command=self._on_clear_holds)
         self.query_button.pack(side=tk.LEFT, padx=(0, 6))
         self.start_button.pack(side=tk.LEFT, padx=(0, 6))
         self.stop_button.pack(side=tk.LEFT, padx=(0, 6))
+        self.collect_button.pack(side=tk.LEFT, padx=(0, 6))
         self.clear_button.pack(side=tk.LEFT)
         self.retry_collect = tk.BooleanVar(value=False)
         ttk.Checkbutton(
@@ -97,10 +103,19 @@ class EggApp:
         ttk.Label(work, textvariable=self.status).pack(anchor=tk.W)
         self.slots = tk.Text(work, height=6, wrap=tk.WORD)
         self.slots.pack(fill=tk.X, pady=4)
-        self.board = tk.Text(work, height=12, wrap=tk.WORD)
+        self.board = tk.Text(work, height=8, wrap=tk.WORD)
         self.board.pack(fill=tk.BOTH, expand=True, pady=4)
-        self.log_box = tk.Text(frame, height=10, wrap=tk.WORD)
+        log_frame = ttk.LabelFrame(paned, text="日志", padding=8)
+        paned.add(log_frame, weight=2)
+        log_actions = ttk.Frame(log_frame)
+        log_actions.pack(fill=tk.X)
+        ttk.Button(log_actions, text="复制日志", command=self._copy_log).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(log_actions, text="保存日志", command=self._save_log).pack(side=tk.LEFT)
+        log_scroll = ttk.Scrollbar(log_frame)
+        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_box = tk.Text(log_frame, height=8, wrap=tk.WORD, yscrollcommand=log_scroll.set)
         self.log_box.pack(fill=tk.BOTH, expand=True)
+        log_scroll.configure(command=self.log_box.yview)
         for widget in (self.slots, self.board, self.log_box):
             widget.configure(state=tk.DISABLED)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -119,11 +134,16 @@ class EggApp:
             state=_enabled(can_start(connected, self.query, self.store.ok, self.running or self._busy))
         )
         self.stop_button.configure(state=_enabled(self.running))
+        self.collect_button.configure(state=_enabled(connected and not self.running and not self._busy))
         self.disconnect_button.configure(state=_enabled((connected or self.running) and not self._busy))
-        _set_text(self.slots, format_incubators(self.store, None, fresh=False))
+        if self.engine is not None:
+            _set_text(self.slots, self.engine.board_text())
+        else:
+            _set_text(self.slots, format_incubators(self.store, None, fresh=False))
         _set_text(self.board, format_board(self.query, self.store))
 
     def _log(self, message: str) -> None:
+        message = _redact_log(message)
         _set_text(self.log_box, message + "\n", append=True)
         try:
             self._log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -197,6 +217,9 @@ class EggApp:
             self.zone.set("")
         self.query = None
         self.status.set("密码已验证。请选择区服后再连接。")
+        char_id = _selected_role(self.role.get(), self._roles)
+        if char_id is not None:
+            self.store.bind_scope(self.account.get().strip(), char_id)
         self._refresh_view()
 
     def _on_connect(self) -> None:
@@ -252,6 +275,8 @@ class EggApp:
             return
         self.status.set("正在查询")
 
+        engine.begin()
+
         async def action():
             return await engine.query()
 
@@ -278,7 +303,8 @@ class EggApp:
 
         async def action():
             report = await engine.run(confirmed=True, retry_uncertain_collect=retry)
-            self.query = await engine.query() if self.session.connected and not engine.stop_requested else self.query
+            if self.session.connected and not engine.abort_requested:
+                self.query = await engine.query()
             return report
 
         def done(report):
@@ -292,7 +318,54 @@ class EggApp:
     def _on_stop(self) -> None:
         if self.engine is not None:
             self.engine.request_stop()
-        self.status.set("正在停止并收取，不再孵化")
+        self.status.set("正在停止，不再发送新的孵化或收取")
+
+    def _on_collect(self) -> None:
+        engine = self.engine
+        if engine is None or not self.session.connected:
+            self._log("请先连接。")
+            return
+        if not messagebox.askokcancel(
+            "确认收取",
+            collect_confirmation_text(self.query, self.retry_collect.get()),
+        ):
+            self._log("已取消。没有发送收取。")
+            return
+        engine.begin()
+        self.running = True
+        self.status.set("正在收取当前就绪的蛋")
+        self._refresh_view()
+        retry = self.retry_collect.get()
+
+        async def action():
+            report = await engine.collect_ready(confirmed=True, retry_uncertain_collect=retry)
+            if self.session.connected and not engine.abort_requested:
+                self.query = await engine.query()
+            return report
+
+        def done(report):
+            self.running = False
+            self.status.set(report.detail)
+            self._log(report.detail)
+            self._refresh_view()
+
+        self._submit(action(), done)
+
+    def _copy_log(self) -> None:
+        text = _redact_log(self.log_box.get("1.0", tk.END))
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self._log("已复制日志。")
+
+    def _save_log(self) -> None:
+        text = _redact_log(self.log_box.get("1.0", tk.END))
+        try:
+            self._log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._log_path.write_text(text, encoding="utf-8")
+        except OSError as exc:
+            self._log(f"保存日志失败：{exc.__class__.__name__}")
+            return
+        self._log("已保存日志。")
 
     def _on_clear_holds(self) -> None:
         if self.running:
@@ -364,6 +437,15 @@ class EggApp:
             done(value)
 
         self.root.after(100, poll)
+
+
+def _redact_log(text: str) -> str:
+    text = re.sub(
+        r"(?i)(password|session(?:_id)?|cookie|token|sid)\s*[=:]\s*\S+",
+        lambda match: match.group(1) + "=[REDACTED]",
+        text,
+    )
+    return text
 
 
 def _field(parent, row: int, label: str, variable: tk.StringVar, *, secret: bool) -> None:
