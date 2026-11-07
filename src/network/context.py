@@ -6,6 +6,7 @@ import json
 import logging
 import tempfile
 import threading
+from asyncio import QueueEmpty
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -130,6 +131,16 @@ class MessageSubscription:
         if not self._closed:
             self._router.unsubscribe(self._queue)
             self._closed = True
+
+    def drain_pending(self) -> int:
+        """Drop messages already queued before a new request is sent."""
+        dropped = 0
+        while True:
+            try:
+                self._queue.get_nowait()
+            except QueueEmpty:
+                return dropped
+            dropped += 1
 
 
 class MessageRouter:

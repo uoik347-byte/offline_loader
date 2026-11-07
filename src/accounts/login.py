@@ -314,6 +314,7 @@ async def http_login(
     proxy_url: Optional[str] = None,
     network_mode: str = "legacy",
     diagnostic_dir: Optional[str] = None,
+    save_diagnostics: bool = True,
 ) -> LoginResult:
     """Query the configured role and return the selected role's login result."""
     conf = {} if network_mode == "system" else load_user_config()
@@ -379,10 +380,11 @@ async def http_login(
             result.blocked_reason = f"HTTP {status}：服务器拒绝继续登录"
         elif is_captcha_page(response_body.decode("utf-8", errors="replace")):
             result.blocked_reason = "登录需要人机验证"
-        result.error_msg = _save_login_failure(
-            stage, request_url, response, response_body, result.error_msg, account, password,
-            **({"diagnostic_dir": diagnostic_dir} if diagnostic_dir is not None else {}),
-        )
+        if save_diagnostics:
+            result.error_msg = _save_login_failure(
+                stage, request_url, response, response_body, result.error_msg, account, password,
+                **({"diagnostic_dir": diagnostic_dir} if diagnostic_dir is not None else {}),
+            )
         if browser_verification and is_captcha_page(response_body.decode("utf-8", errors="replace")):
             if effective_proxy:
                 return result  # The headless worker must not open a direct browser.

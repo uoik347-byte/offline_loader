@@ -1,0 +1,54 @@
+亚比蛋孵化收取工具
+====================
+
+这个窗口只做三件事：用仓库里现有的直接登录连接游戏、查询蛋列表、在用户确认后孵化并收取。
+它不读取 config.json、session.txt、cookie 或密码文件，也不使用代理环境变量。
+打开后保持空闲。重新打开不会自动继续。停止后不再发送新的 1-4 或 1223；已经提交的蛋留在游戏里。
+
+协议只使用 scripts/auto_hatch.py 里已经写明的字段：
+- 17 / 1-8：es[].ei、pmid、st，st=100 才可以收取
+- 17 / 1=1：es[].ei
+- 17 / 1-4：eggId 和孵化格 id（1、2、3）
+- 13 / 1223：loc=4，id=pmid；回执命令是 2223
+2223 除了 _cmd 和 id，没有更完整的字段说明。本工具把 id 与这次发送的 pmid 对齐，
+再用下一次成功的 1-8 确认该 ei 已经消失。对不上、超时或断开时，记为不确定，不再自动重发。
+1-8 回包没有格子编号。本机提交过的格子会一直占着，直到收取被确认，或用户按下“确认格子已空”。
+查询超时或 es 不是列表时，结果是未知，不是空列表。程序不会把 1.1 秒当成孵化完成，
+而是至少每 1 秒查询一次 1-8，最多查询 60 秒；到时格子仍然占用。
+
+本仓库快照没有 LICENSE 文件。工具是在这个已授权的 fork 里新增的代码，并直接调用同一仓库的
+登录和长连接模块。它不把 Vue 或 WPF 加载器再包一层，也不改写 AolaNative。
+连接模块会在登录后做仓库里原有的玩家初始化，并按原有 60 秒节奏发送会话心跳。窗口本身不提供战斗、购买或其他脚本。
+
+在 Windows x64 上构建
+---------------------
+需要 64 位 Windows、Python 3.12 和网络，以便安装 requirements.txt 里的依赖。
+在仓库根目录执行：
+
+    powershell -ExecutionPolicy Bypass -File .\build_egg_hatch.ps1
+
+成功时输出 dist\AolaEggHatch.exe。脚本会检查文件以 MZ 开头。
+PyInstaller 不能在 Linux 上直接交叉编译。requirements.txt 最后一行是本地项目 “.”；
+若打包时安装这个本地项目失败，可以改为只安装 requirements.lock 和 PyInstaller，
+再在源码目录执行 python -m PyInstaller --noconfirm --clean egg_hatch.spec。
+
+本次环境实际产出
+----------------
+在 Linux 上用 Wine 9 运行 Windows CPython 3.12.16（astral-sh install_only，含 Tk 8.6）
+和 PyInstaller 6.16.0，生成 dist/AolaEggHatch.exe。
+file 与 PE 头：PE32+ GUI，x86-64，machine 0x8664，magic 0x20b，subsystem 2，约 20.7 MB。
+官方 python.org 的 amd64 安装包是 32 位引导程序，当前 Wine 前缀缺少 syswow64\ntdll.dll，未能用它安装。
+Wine 启动该 exe 后进程保持运行，旁边日志只有“程序已打开，当前空闲。不会自动孵化或收取。”
+窗口类名里能看到 Tk。没有点击登录，没有连接游戏。
+这不能证明原生 Windows 启动，也不能证明游戏内孵化或收取。
+
+运行
+----
+双击 exe 后填写账号、密码和角色 ID，登录，选择区服，连接，再点“查询列表”。
+确认对话框点确定后才会发送孵化或收取。密码只留在本次登录请求里，界面会清空密码框，日志不写密码和会话。
+本机占用记录写在 exe 旁边的 egg-hatch-local-state.json，里面只有蛋编号、格子和阶段。
+
+测试
+----
+python -m unittest tests.test_egg_hatch_sim
+这些测试是模拟的，标题都带 simulated。它们不登录、不连接游戏，也不能证明 exe 能在 Windows 上启动或在游戏里孵化。

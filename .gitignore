@@ -16,6 +16,11 @@
 !/src/**/*.py
 !/scripts/*.py
 /scripts/test_*.py
+!/tests/__init__.py
+!/tests/test_egg_hatch_sim.py
+!/egg_hatch.spec
+!/build_egg_hatch.ps1
+!/docs/egg-hatch-build.txt
 /scripts/verify.py
 /scripts/_fake_mihomo.py
 !/Com/**
