@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from src.game.eggs.engine import QueryView
+from src.game.eggs.panel import IncubatorView, format_snapshot
 from src.game.eggs.store import HoldStore
 
 
@@ -17,15 +18,29 @@ def confirmation_text(query: QueryView, store: HoldStore, retry_uncertain_collec
     return (
         "开始后会向当前已连接的游戏服务器发送孵化（1-4）和收取（1223）。\n"
         f"最近一次查询：待处理 {pending} 个，未孵化 {unhatched} 个，本机占用记录 {held} 条。\n"
-        "停止后不再发送新的指令。已经提交的蛋会留在游戏里。\n"
+        "点“停止并收取”后马上不再孵化。已经可收取的蛋会收取；"
+        "已经提交但还没就绪的蛋，只在现有时限内等待就绪后再收取。\n"
+        "只有新的 1-8 确认是空的，才会显示格子已空。"
+        "关闭窗口或断开会立刻停下，蛋留在游戏里，重新打开不会自动继续。\n"
         f"这次{retry}重试上次结果不确定的收取。已经提交过的孵化不会重发。\n"
         "重新打开程序不会自动继续。\n"
         "确定开始吗？"
     )
 
 
-def format_board(query: QueryView | None, store: HoldStore) -> str:
+def format_board(
+    query: QueryView | None,
+    store: HoldStore,
+    snapshot: IncubatorView | None = None,
+) -> str:
     lines: list[str] = []
+    if snapshot is None:
+        lines.append("孵化格：空闲")
+        lines.append("尚未成功刷新服务器列表。这不是空列表。")
+        lines.append("协议没有剩余时间，这里不显示倒计时。")
+    else:
+        lines.append(format_snapshot(snapshot))
+    lines.append("")
     if query is None:
         lines.append("还没有查询。打开程序后保持空闲。")
     elif not query.ok:

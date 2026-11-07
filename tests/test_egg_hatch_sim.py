@@ -42,6 +42,7 @@ class ScriptedTransport:
         self.sent: list[tuple] = []
         self.connected = True
         self.should_stop = None
+        self.allow_command = None
         self.on_send = None
         self._seq = 0
         self._inbox: list[tuple[int, dict]] = []
@@ -66,6 +67,10 @@ class ScriptedTransport:
         if not self.connected:
             return Exchange("disconnected", sent=False)
         self._drop_queued()
+        if self.allow_command is not None and not self.allow_command(ext_id, cmd):
+            return Exchange("stopped", sent=False)
+        if self.should_stop and self.should_stop():
+            return Exchange("stopped", sent=False)
         self.sent.append((ext_id, cmd, dict(param)))
         if self.on_send is not None:
             self.on_send(ext_id, cmd, param)
@@ -289,7 +294,7 @@ class SimulatedEggTests(unittest.IsolatedAsyncioTestCase):
                 seen["hatch"] = True
             base(ext, cmd, param)
             if cmd == "1-8" and seen["hatch"]:
-                engine.request_stop()
+                engine.request_abort()
 
         transport.on_send = wrapped
         world.st[10] = 0
@@ -501,6 +506,175 @@ class SimulatedEggTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("停止", text)
         self.assertIn("不会", text)
         self.assertIn("还没有查询", format_board(None, store))
+
+    async def test_simulated_stop_collects_ready_and_waits_for_submitted(self) -> None:
+        world = World()
+        world.unhatched = [10, 11]
+        engine, transport = _engine(world, readiness_limit=3)
+        fresh = transport.on_send
+        polls = {"n": 0}
+
+        def dispatch(ext, cmd, param):
+            if cmd == "1-4":
+                egg_id = param["eggId"]
+                transport.push({"_cmd": "1-4", "eggId": egg_id, "id": param["id"]})
+                world.pending[egg_id] = 8000 + egg_id
+                world.st[egg_id] = 0
+                if egg_id in world.unhatched:
+                    world.unhatched.remove(egg_id)
+                if egg_id == 10:
+                    engine.request_stop()
+                return
+            if cmd == "1-8":
+                polls["n"] += 1
+                if polls["n"] >= 3:
+                    world.st[10] = 100
+            fresh(ext, cmd, param)
+
+        transport.on_send = dispatch
+        report = await engine.run(confirmed=True)
+        hatches = [param["eggId"] for _ext, cmd, param in transport.sent if cmd == "1-4"]
+        self.assertEqual(hatches, [10])
+        self.assertEqual(_cmds(transport).count("1223"), 1)
+        self.assertEqual(report.kind, "cleared")
+        self.assertIn("格子已空", report.detail)
+        self.assertEqual(engine.snapshot().occupancy, 0)
+        self.assertNotIn("11", [str(item) for item in hatches])
+
+    async def test_simulated_drain_ready_many_without_new_hatch(self) -> None:
+        world = World()
+        world.pending = {4: 40, 5: 50}
+        world.st[4] = 100
+        world.st[5] = 100
+        world.unhatched = [9]
+        engine, transport = _engine(world)
+        engine.request_stop()
+        report = await engine.run(confirmed=True)
+        self.assertNotIn("1-4", _cmds(transport))
+        self.assertEqual(_cmds(transport).count("1223"), 2)
+        self.assertEqual(report.collected_ids, [4, 5])
+        self.assertEqual(report.kind, "cleared")
+        view = engine.snapshot()
+        self.assertEqual(view.occupancy, 0)
+        self.assertEqual(view.confirmed_collects, 2)
+
+    async def test_simulated_drain_unknown_timeout_and_ack_are_not_empty(self) -> None:
+        world = World()
+        world.pending = {5: 50}
+        world.st[5] = 100
+        world.unhatched = []
+        world.drop_status = True
+        engine, transport = _engine(world)
+        engine.request_stop()
+        report = await engine.run(confirmed=True)
+        self.assertEqual(report.kind, "not_cleared")
+        self.assertNotIn("格子已空", report.detail)
+        self.assertIn("未确认清空", report.detail)
+        self.assertNotIn("1223", _cmds(transport))
+        self.assertFalse(engine.snapshot().authoritative)
+        from src.game.eggs.panel import format_snapshot
+        self.assertIn("未知", format_snapshot(engine.snapshot()))
+
+        world.drop_status = False
+        world.ack = False
+        engine, transport = _engine(world)
+        engine.request_stop()
+        report = await engine.run(confirmed=True)
+        self.assertEqual(_cmds(transport).count("1223"), 1)
+        self.assertEqual(report.kind, "not_cleared")
+        self.assertNotIn("格子已空", report.detail)
+        self.assertTrue(engine.store.collect_blocked(50))
+
+    async def test_simulated_drain_disconnect_and_hatch_race_send_nothing_new(self) -> None:
+        world = World()
+        world.pending = {5: 50}
+        world.st[5] = 100
+        world.unhatched = []
+        engine, transport = _engine(world)
+        transport.connected = False
+        engine.request_stop()
+        report = await engine.run(confirmed=True)
+        self.assertEqual(report.kind, "not_cleared")
+        self.assertEqual(transport.sent, [])
+
+        world = World()
+        world.unhatched = [10, 11]
+        engine, transport = _engine(world)
+
+        def allow(ext, cmd):
+            if cmd == "1-4":
+                engine.draining = True
+            return engine._allow_command(ext, cmd)
+
+        transport.allow_command = allow
+        report = await engine.run(confirmed=True)
+        self.assertNotIn("1-4", _cmds(transport))
+        self.assertNotIn("1223", _cmds(transport))
+        self.assertEqual(report.kind, "cleared")
+
+    async def test_simulated_not_ready_past_deadline_is_not_cleared(self) -> None:
+        world = World()
+        world.pending = {5: 50}
+        world.st[5] = 0
+        world.unhatched = [10]
+        engine, transport = _engine(world, readiness_limit=1)
+        engine.request_stop()
+        report = await engine.run(confirmed=True)
+        self.assertNotIn("1-4", _cmds(transport))
+        self.assertNotIn("1223", _cmds(transport))
+        self.assertEqual(report.kind, "not_cleared")
+        self.assertLess(engine.clock.now(), 30)
+
+    async def test_simulated_status_panel_slots_names_and_idle_refresh(self) -> None:
+        from src.game.eggs.names import egg_display_name
+        from src.game.eggs.panel import format_snapshot
+        from src.game.eggs.protocol import PendingEgg
+
+        catalog = {7: "火焰蛋"}
+        self.assertEqual(egg_display_name(10, None, catalog), "eggId=10")
+        self.assertNotIn("火焰蛋", egg_display_name(7, None, catalog))
+        self.assertEqual(egg_display_name(10, 7, catalog), "火焰蛋（eggId=10）")
+        self.assertEqual(egg_display_name(10, 8, catalog), "eggId=10")
+
+        world = World()
+        world.pending = {10: 80}
+        world.st[10] = 100
+        engine, transport = _engine(world)
+        engine.time_text = lambda: "08:00:00"
+        engine.store.upsert(_hold(10, slot=1, phase="hatching", pmid=80, st=100, hatch_sent=True))
+        view = await engine.refresh_status()
+        text = format_snapshot(view)
+        self.assertEqual(_cmds(transport), ["1-8"])
+        self.assertEqual(view.phase, "ready")
+        self.assertEqual(view.occupancy, 1)
+        self.assertIn("格 1", text)
+        self.assertNotIn("未知格位", text)
+        self.assertIn("08:00:00", text)
+        self.assertIn("eggId=10", text)
+        self.assertNotIn("火焰蛋", text)
+        self.assertIn("种类", text)
+        engine._active = True
+        await engine.refresh_status()
+        self.assertEqual(_cmds(transport), ["1-8"])
+
+        engine._active = False
+        engine.store.records.clear()
+        engine._remember_ok([PendingEgg(12, 90, 0)])
+        self.assertEqual(engine.snapshot().eggs[0].slot_text, "未知格位")
+        engine._remember_fail("1-8 查询超时，列表未知，不能当成空列表")
+        stale = format_snapshot(engine.snapshot())
+        self.assertIn("未知", stale)
+        self.assertIn("不能当成空列表", stale)
+        self.assertNotIn("占用：0", stale)
+        self.assertIn("eggId=12", stale)
+        self.assertIn("上次成功", stale)
+
+        logs = []
+        engine.log = logs.append
+        engine.draining = False
+        engine.request_stop()
+        engine.request_stop()
+        self.assertEqual(len(logs), 1)
 
     def test_simulated_public_error_redacts_assignment(self) -> None:
         text = public_error(RuntimeError("password=simulated-password-value"))
@@ -773,6 +947,7 @@ class SimulatedWindowTests(unittest.TestCase):
         log = ROOT / "logs" / "simulated-ui.log"
         app = EggApp(root, store_path=store, log_path=log)
         try:
+            self.assertEqual(str(app.stop_button["text"]), "停止并收取")
             self.assertEqual(str(app.start_button["state"]), "disabled")
             self.assertFalse(app.retry_collect.get())
             self.assertIn("空闲", app.status.get())
@@ -780,6 +955,8 @@ class SimulatedWindowTests(unittest.TestCase):
             self.assertEqual(str(app.connect_button["state"]), "disabled")
             board = app.board.get("1.0", "end")
             self.assertIn("还没有查询", board)
+            self.assertIn("尚未成功刷新", board)
+            self.assertIn("不显示倒计时", board)
         finally:
             app._on_close()
 

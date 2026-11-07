@@ -26,6 +26,7 @@ class ContextTransport:
         self._context = context
         self._stop_check = stop_check
         self.should_stop = None
+        self.allow_command = None
         self._log = log
         self._subscription = None
 
@@ -62,6 +63,10 @@ class ContextTransport:
         self.open()
         assert self._subscription is not None
         self._subscription.drain_pending()
+        if self._stopped():
+            return Exchange("stopped")
+        if self.allow_command is not None and not self.allow_command(ext_id, cmd):
+            return Exchange("stopped")
         self._log(format_send(ext_id, cmd, param))
         try:
             await self._context.socket.send_xt_message(ext_id, cmd, dict(param))
