@@ -9,7 +9,7 @@ from tkinter import messagebox, ttk
 
 from src.config import PROJECT_ROOT
 from src.game.eggs.engine import EggEngine
-from src.game.eggs.panel import IncubatorView
+from src.game.eggs.panel import format_incubators
 from src.game.eggs.presenter import can_start, confirmation_text, format_board
 from src.game.eggs.protocol import public_error
 from src.game.eggs.session import CancelledStep, EggSession, format_zone_choice
@@ -31,9 +31,7 @@ class EggApp:
         self._future = None
         self.engine: EggEngine | None = None
         self.query = None
-        self.snapshot: IncubatorView | None = None
         self.running = False
-        self._status_flight = False
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
@@ -97,14 +95,15 @@ class EggApp:
             variable=self.retry_collect,
         ).pack(anchor=tk.W, pady=4)
         ttk.Label(work, textvariable=self.status).pack(anchor=tk.W)
+        self.slots = tk.Text(work, height=6, wrap=tk.WORD)
+        self.slots.pack(fill=tk.X, pady=4)
         self.board = tk.Text(work, height=12, wrap=tk.WORD)
         self.board.pack(fill=tk.BOTH, expand=True, pady=4)
         self.log_box = tk.Text(frame, height=10, wrap=tk.WORD)
         self.log_box.pack(fill=tk.BOTH, expand=True)
-        for widget in (self.board, self.log_box):
+        for widget in (self.slots, self.board, self.log_box):
             widget.configure(state=tk.DISABLED)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.root.after(5000, self._status_tick)
 
     def _refresh_view(self) -> None:
         connected = self.session.connected
@@ -121,7 +120,8 @@ class EggApp:
         )
         self.stop_button.configure(state=_enabled(self.running))
         self.disconnect_button.configure(state=_enabled((connected or self.running) and not self._busy))
-        _set_text(self.board, format_board(self.query, self.store, self.snapshot))
+        _set_text(self.slots, format_incubators(self.store, None, fresh=False))
+        _set_text(self.board, format_board(self.query, self.store))
 
     def _log(self, message: str) -> None:
         _set_text(self.log_box, message + "\n", append=True)
@@ -216,7 +216,7 @@ class EggApp:
                 store=self.store,
                 log=self._thread_log,
             )
-            self.engine.on_snapshot = self._on_snapshot
+            self.engine.on_board = self._on_board
 
         self._submit(action(), lambda _value: self._set_idle("已连接，空闲"), "区服长连接失败")
 
@@ -278,13 +278,13 @@ class EggApp:
 
         async def action():
             report = await engine.run(confirmed=True, retry_uncertain_collect=retry)
-            if self.session.connected and not engine.abort_requested:
-                self.query = await engine.query()
+            self.query = await engine.query() if self.session.connected and not engine.stop_requested else self.query
             return report
 
         def done(report):
             self.running = False
-            self.status.set(report.detail)
+            self.status.set("已停止，空闲" if report.stopped else "运行结束，空闲")
+            self._log(report.detail)
             self._refresh_view()
 
         self._submit(action(), done)
@@ -327,41 +327,8 @@ class EggApp:
     def _thread_log(self, message: str) -> None:
         self.root.after(0, lambda message=message: self._log(message))
 
-    def _on_snapshot(self, view: IncubatorView) -> None:
-        self.root.after(0, lambda view=view: self._show_snapshot(view))
-
-    def _show_snapshot(self, view: IncubatorView) -> None:
-        self.snapshot = view
-        self._refresh_view()
-
-    def _status_tick(self) -> None:
-        self.root.after(5000, self._status_tick)
-        engine = self.engine
-        if (
-            engine is None
-            or not self.session.connected
-            or self.running
-            or self._busy
-            or self._status_flight
-        ):
-            return
-        self._status_flight = True
-        future = self._call(engine.refresh_status())
-
-        def poll() -> None:
-            if not future.done():
-                self.root.after(200, poll)
-                return
-            self._status_flight = False
-            try:
-                view = future.result()
-            except Exception as exc:
-                self._log(public_error(exc))
-                return
-            if isinstance(view, IncubatorView):
-                self._show_snapshot(view)
-
-        self.root.after(200, poll)
+    def _on_board(self, text: str) -> None:
+        self.root.after(0, lambda text=text: _set_text(self.slots, text))
 
     def _submit(self, coro, done, failure_status: str = "出现错误，空闲") -> None:
         self._op += 1
