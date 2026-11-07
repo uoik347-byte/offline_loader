@@ -1218,6 +1218,138 @@ class SimulatedRoleAndConnectTests(unittest.IsolatedAsyncioTestCase):
             server.close()
             await server.wait_closed()
 
+    def test_simulated_login_summary_separates_reject_timeout_and_parse(self) -> None:
+        from src.network.socket_client import summarize_login_reply
+
+        common = dict(
+            honor_count=0,
+            parse_fail_count=0,
+            parse_fail_bytes=0,
+            parse_fail_type=None,
+            closed_note="",
+            wait_seconds=15,
+        )
+        text, rejected = summarize_login_reply(None, body_bytes=0, timed_out=True, **common)
+        self.assertIn("没有收到回包", text)
+        self.assertFalse(rejected)
+        text, rejected = summarize_login_reply(
+            {"_cmd": "logKO", "_action": 20021, "msg": "account-secret-text"},
+            body_bytes=12,
+            timed_out=False,
+            **common,
+        )
+        self.assertTrue(rejected)
+        self.assertIn("命令=logKO", text)
+        self.assertIn("动作=20021", text)
+        self.assertIn("12", text)
+        self.assertNotIn("account-secret-text", text)
+        text, rejected = summarize_login_reply(
+            {"_cmd": "not a safe command", "id": "user-secret"},
+            body_bytes=8,
+            timed_out=False,
+            **common,
+        )
+        self.assertFalse(rejected)
+        self.assertIn("无短命令名", text)
+        self.assertNotIn("user-secret", text)
+        text, _rejected = summarize_login_reply(
+            None,
+            body_bytes=0,
+            timed_out=False,
+            honor_count=0,
+            parse_fail_count=2,
+            parse_fail_bytes=40,
+            parse_fail_type=1,
+            closed_note="",
+            wait_seconds=15,
+        )
+        self.assertIn("解析失败2次", text)
+        self.assertIn("40字节", text)
+        self.assertIn("类型=1", text)
+
+    async def test_simulated_login_rejection_is_not_called_no_reply(self) -> None:
+        from src.network.socket_client import GameSocket
+
+        socket = GameSocket("simulated-session-value", network_mode="system")
+
+        async def send(_packet):
+            return None
+
+        async def recv(timeout=15):
+            return ({"_cmd": "logKO", "_action": 20021, "msg": "sid-secret"}, b"abcdef")
+
+        socket._send_raw = send
+        socket._recv_any_packet = recv
+        result = await socket.login("59 库斯特星", "user-secret", "sid-secret")
+        self.assertIsNone(result)
+        self.assertTrue(socket.login_explicit_reject)
+        self.assertIn("命令=logKO", socket.last_login_summary)
+        self.assertNotIn("sid-secret", socket.last_login_summary)
+        self.assertNotIn("user-secret", socket.last_login_summary)
+
+    async def test_simulated_explicit_reject_does_not_open_second_transport(self) -> None:
+        from src.accounts.login import ZoneData
+        from src.network import socket_client
+
+        calls = []
+
+        class FakeSocket:
+            def __init__(self, *_args, **_kwargs):
+                self.disconnect_reason = ""
+                self.last_login_summary = ""
+                self.login_explicit_reject = False
+
+            async def connect_tcp(self, host, port, timeout=15.0, policy_timeout=None):
+                calls.append("tcp")
+                return True
+
+            async def connect_ws(self, domain, port, timeout=2):
+                calls.append("ws")
+                return True
+
+            async def login(self, *_args):
+                calls.append("login")
+                self.last_login_summary = "服务器拒绝游戏登录，命令=logKO，动作=20021，正文4字节。不记录拒绝原文。"
+                self.login_explicit_reject = True
+                return None
+
+            async def close(self):
+                calls.append("close")
+
+        zone = ZoneData(1122, "可拉蟹星", "203.0.113.16", 8101, flash_port=8001, domain="h5.example")
+        original = socket_client.GameSocket
+        socket_client.GameSocket = FakeSocket
+        try:
+            notes = []
+            sock = await socket_client.login_and_connect(
+                zone, "user-field", "sid-field", network_mode="system", stage_notes=notes
+            )
+        finally:
+            socket_client.GameSocket = original
+        self.assertIsNone(sock)
+        self.assertEqual(calls, ["tcp", "login", "close"])
+        self.assertIn("命令=logKO", "；".join(notes))
+        self.assertNotIn("sid-field", "；".join(notes))
+
+    def test_simulated_windowed_stdio_none_can_print(self) -> None:
+        import sys
+        from src.game.eggs.win_stdio_hook import ensure_stdio
+
+        old_out, old_err = sys.stdout, sys.stderr
+        sys.stdout = None
+        sys.stderr = None
+        opened = None
+        try:
+            ensure_stdio()
+            opened = sys.stdout
+            print("startup-ok")
+            sys.stderr.write("startup-err\n")
+        finally:
+            if opened is not None and opened not in {old_out, old_err}:
+                opened.close()
+            sys.stdout = old_out
+            sys.stderr = old_err
+
 
 if __name__ == "__main__":
     unittest.main()

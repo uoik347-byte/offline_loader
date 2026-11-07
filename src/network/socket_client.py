@@ -91,6 +91,86 @@ async def _read_nul_terminated(readexactly, timeout: float) -> bytes:
                 raise ValueError("安全策略过长")
 
 
+def _safe_token(value: object, limit: int = 40) -> str:
+    text = "" if value is None else str(value)
+    if not text or len(text) > limit:
+        return ""
+    if not text.isascii():
+        return ""
+    if any(not (char.isalnum() or char in "_=.-") for char in text):
+        return ""
+    return text
+
+
+def _safe_close_note(reason: str) -> str:
+    text = (reason or "").replace("\n", " ").strip()
+    if text.startswith("TCP EOF"):
+        return text[:120]
+    if text.startswith("TCP 收包失败:") or text.startswith("WSS 收包失败:") or text.startswith("发送失败:"):
+        kind = text.split(":", 1)[0]
+        tail = text.split(":", 1)[1].strip().split(":", 1)[0].strip()
+        name = tail if _safe_token(tail, 40) else "异常"
+        return f"{kind}: {name}"
+    if text.startswith("WSS 已关闭:"):
+        code = ""
+        for part in text.replace(",", " ").split():
+            if part.startswith("code="):
+                code = part
+                break
+        return "WSS 已关闭" + (f" {code}" if _safe_token(code.removeprefix("code="), 8) else "")
+    return ""
+
+
+def summarize_login_reply(
+    reply: dict | None,
+    *,
+    body_bytes: int,
+    timed_out: bool,
+    honor_count: int,
+    parse_fail_count: int,
+    parse_fail_bytes: int,
+    parse_fail_type: int | None,
+    closed_note: str,
+    wait_seconds: float,
+) -> tuple[str, bool]:
+    """Classify one game-login observation without copying payload text or ids."""
+    wait = f"{wait_seconds:g}"
+    if isinstance(reply, dict) and reply:
+        command = _safe_token(reply.get("_cmd")) or "无短命令名"
+        action = reply.get("_action")
+        action_text = str(action) if isinstance(action, int) and not isinstance(action, bool) else "无"
+        if reply.get("_cmd") == "logKO":
+            return (
+                f"服务器拒绝游戏登录，命令=logKO，动作={action_text}，"
+                f"正文{body_bytes}字节。不记录拒绝原文。",
+                True,
+            )
+        return (
+            f"收到登录回包但未接受：命令={command}，动作={action_text}，"
+            f"正文{body_bytes}字节，没有正整数 id，也不是 logOK。",
+            False,
+        )
+    if parse_fail_count:
+        type_text = str(parse_fail_type) if parse_fail_type is not None else "无"
+        return (
+            f"登录等待{wait}秒。解析失败{parse_fail_count}次，"
+            f"最后一包{parse_fail_bytes}字节，类型={type_text}。没有可接受的登录回包。",
+            False,
+        )
+    if closed_note:
+        return (f"登录收包结束：{closed_note}。等待上限{wait}秒。", False)
+    if honor_count:
+        return (
+            f"登录等待{wait}秒。只跳过{honor_count}条 honorMsgDispatch，没有登录回包。",
+            False,
+        )
+    if timed_out:
+        return (f"登录等待{wait}秒没有收到回包。", False)
+    if body_bytes:
+        return (f"收到{body_bytes}字节，但不是登录对象。", False)
+    return ("游戏登录没有返回可接受的回包。", False)
+
+
 def endpoint_facts(zone) -> str:
     domain = str(getattr(zone, "domain", "") or "").strip()
     host = str(getattr(zone, "host", "") or "").strip()
@@ -134,6 +214,12 @@ class GameSocket:
 
         self.my_user_id = 0
         self.login_response: dict = {}
+        self.last_login_summary = ""
+        self.login_explicit_reject = False
+        self.record_recv_diag = False
+        self._parse_fail_count = 0
+        self._parse_fail_bytes = 0
+        self._parse_fail_type: int | None = None
         self.active_room_id = -1
         self.active_room_name = ""
 
@@ -485,11 +571,15 @@ class GameSocket:
             try:
                 message = self._decode_server_body(bytes(body_raw))
             except (ValueError, EOFError, IndexError, struct.error) as exc:
+                if self.record_recv_diag:
+                    self._parse_fail_count += 1
+                    self._parse_fail_bytes = len(body_raw)
+                    self._parse_fail_type = body_raw[0]
                 logger.warning(
                     "server packet parse failed: bytes=%d, type=%d, error=%s",
                     len(body_raw),
                     body_raw[0],
-                    exc,
+                    type(exc).__name__,
                 )
                 continue
             return (message, bytes(body_raw))
@@ -614,39 +704,54 @@ class GameSocket:
         发送登录包并接收响应
         """
         packet = build_login_message(zone, user_id, session_id)
-        print(f"[LOGIN] Sending packet: {len(packet)} bytes")
-        print(f"[LOGIN] Header: type={MSG_TYPE_SYS} action={UpCmd.Login} roomId=-1")
-        print(f"[LOGIN] Zone: {zone}")
-        print(f"[LOGIN] UserId: {user_id}")
-        print(f"[LOGIN] Credential loaded (len={len(session_id)})")
+        print(f"[LOGIN] Sending packet: {len(packet)} bytes, zone_bytes={len(zone.encode('utf-8'))}")
         await self._send_raw(packet)
-
-        deadline = asyncio.get_running_loop().time() + 15.0
-        while True:
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                resp, raw = None, None
-                break
-            resp, raw = await self._recv_any_packet(timeout=remaining)
-            if not isinstance(resp, dict) or resp.get('_cmd') != 'honorMsgDispatch':
-                break
-            print("[LOGIN] Honor notification received; waiting for login response")
-        if resp is None and raw is None:
-            print("[LOGIN] No response (timeout)")
+        self.login_explicit_reject = False
+        self._parse_fail_count = 0
+        self._parse_fail_bytes = 0
+        self._parse_fail_type = None
+        self.record_recv_diag = True
+        honor_count = 0
+        wait_seconds = 15.0
+        resp, raw = None, None
+        try:
+            deadline = asyncio.get_running_loop().time() + wait_seconds
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    resp, raw = None, None
+                    break
+                resp, raw = await self._recv_any_packet(timeout=remaining)
+                if not isinstance(resp, dict) or resp.get("_cmd") != "honorMsgDispatch":
+                    break
+                honor_count += 1
+        finally:
+            self.record_recv_diag = False
+        summary, explicit = summarize_login_reply(
+            resp if isinstance(resp, dict) else None,
+            body_bytes=len(raw) if isinstance(raw, (bytes, bytearray)) else 0,
+            timed_out=resp is None and raw is None and not self.disconnect_reason,
+            honor_count=honor_count,
+            parse_fail_count=self._parse_fail_count,
+            parse_fail_bytes=self._parse_fail_bytes,
+            parse_fail_type=self._parse_fail_type,
+            closed_note=_safe_close_note(self.disconnect_reason),
+            wait_seconds=wait_seconds,
+        )
+        self.last_login_summary = summary
+        self.login_explicit_reject = explicit
+        if not isinstance(resp, dict) or not resp:
             return None
-        if raw:
-            print(f"[LOGIN] Raw body {len(raw)} bytes")
-
-        if isinstance(resp, dict) and resp:
-            self.login_response = dict(resp)
-            uid = resp.get('id')
-            if uid is not None:
-                self.my_user_id = int(uid) if not isinstance(uid, int) else uid
-            print(f"[LOGIN] id={self.my_user_id}, cmd={resp.get('_cmd','?')}")
-            if self.my_user_id > 0:
-                return resp
-            if resp.get('_cmd') == 'logOK':
-                return resp
+        self.login_response = dict(resp)
+        uid = resp.get("id")
+        if uid is not None and not isinstance(uid, bool):
+            try:
+                self.my_user_id = uid if isinstance(uid, int) else int(uid)
+            except (TypeError, ValueError):
+                self.my_user_id = 0
+        if self.my_user_id > 0 or resp.get("_cmd") == "logOK":
+            self.login_explicit_reject = False
+            return resp
         return None
     # ── 发送扩展消息 ──
 
@@ -856,7 +961,13 @@ async def login_and_connect(
                 _remember_stage(stage_notes, "Flash TCP 游戏登录已接受")
                 return sock
             if resp is None:
-                _remember_stage(stage_notes, "Flash TCP 已连上，游戏登录没有返回可接受的回包")
+                _remember_stage(
+                    stage_notes,
+                    "Flash TCP 已连上，" + (sock.last_login_summary or "游戏登录没有返回可接受的回包"),
+                )
+                if sock.login_explicit_reject:
+                    _remember_stage(stage_notes, "已收到明确拒绝，不再尝试 H5 WebSocket")
+                    return None
             else:
                 command = str(resp.get("_cmd", ""))
                 _remember_stage(
@@ -888,7 +999,10 @@ async def login_and_connect(
             retained = True
             _remember_stage(stage_notes, "H5 WebSocket 游戏登录已接受")
             return sock
-        _remember_stage(stage_notes, "H5 WebSocket 已连上，游戏登录没有返回可接受的回包")
+        _remember_stage(
+            stage_notes,
+            "H5 WebSocket 已连上，" + (sock.last_login_summary or "游戏登录没有返回可接受的回包"),
+        )
         return None
     finally:
         if not retained:

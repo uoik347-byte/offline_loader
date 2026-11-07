@@ -26,7 +26,7 @@ a = Analysis(
     ],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=["src/game/eggs/win_stdio_hook.py"],
     excludes=["pytest", "numpy", "PIL", "pygame"],
     noarchive=False,
 )
@@ -42,6 +42,6 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=True,
+    console=False,
     disable_windowed_traceback=False,
 )
