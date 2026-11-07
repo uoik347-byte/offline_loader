@@ -743,47 +743,93 @@ async def _connect_tcp_with_retry(sock, host, port, timeout, window):
     return False
 
 
+def _remember_stage(stage_notes: list[str] | None, text: str) -> None:
+    if stage_notes is None:
+        return
+    cleaned = text.replace("\n", " ").strip()
+    lowered = cleaned.lower()
+    for marker in ("password", "session_id", "session", "cookie", "token", "sid"):
+        start = lowered.find(marker)
+        if start >= 0:
+            cleaned = cleaned[:start] + "[REDACTED]"
+            break
+    if len(cleaned) > 180:
+        cleaned = cleaned[:180] + "…"
+    stage_notes.append(cleaned)
+
+
 async def login_and_connect(
     zone, user_id: str, session_id: str,
     timeout: float = 15.0,
     proxy_url: str | None = None,
     network_mode: str = "legacy",
     tcp_retry_window: float | None = None,
+    stage_notes: list[str] | None = None,
 ) -> GameSocket | None:
-    """TCP/WSS login; a retry window selects TCP only and retries before sending login."""
+    """TCP/WSS login; a retry window selects TCP only and retries before sending login.
+
+    The socket login packet is zone, user id and session id. It does not resend charId.
+    ``stage_notes`` receives short stage results and must stay free of credentials.
+    """
     if network_mode == "system":
         sock = GameSocket(session_id, network_mode="system")
     else:
         sock = GameSocket(session_id, proxy_url=proxy_url) if proxy_url else GameSocket(session_id)
     retained = False
+    zone_label = f"{zone.zone_index} {zone.zone_name}"
     try:
-        # 策略 2: 原始 TCP (Flash port)
+        # 策略 2: 原始 TCP (Flash port)。flash 端口为 0 时才退到 H5 端口。
         tcp_port = zone.flash_port or zone.port
-        connected = (await _connect_tcp_with_retry(sock, zone.host, tcp_port, timeout, tcp_retry_window)
-                     if tcp_retry_window is not None else await sock.connect_tcp(zone.host, tcp_port, timeout))
+        if not zone.host or tcp_port <= 0:
+            connected = False
+            _remember_stage(stage_notes, "Flash TCP 未尝试：区服没有 host 或端口")
+        else:
+            connected = (await _connect_tcp_with_retry(sock, zone.host, tcp_port, timeout, tcp_retry_window)
+                         if tcp_retry_window is not None else await sock.connect_tcp(zone.host, tcp_port, timeout))
+            if not connected:
+                _remember_stage(
+                    stage_notes,
+                    "Flash TCP 未连上：" + (sock.disconnect_reason or "无断开说明"),
+                )
         if connected:
-            resp = await sock.login(
-                f"{zone.zone_index} {zone.zone_name}",
-                user_id, session_id
+            resp = await sock.login(zone_label, user_id, session_id)
+            accepted = resp is not None and (
+                tcp_retry_window is None or resp.get("_cmd") == "logOK"
             )
-            if resp is not None and (tcp_retry_window is None or resp.get('_cmd') == 'logOK'):
+            if accepted:
                 retained = True
+                _remember_stage(stage_notes, "Flash TCP 游戏登录已接受")
                 return sock
+            if resp is None:
+                _remember_stage(stage_notes, "Flash TCP 已连上，游戏登录没有返回可接受的回包")
+            else:
+                command = str(resp.get("_cmd", ""))
+                _remember_stage(
+                    stage_notes,
+                    f"Flash TCP 已连上，回包命令不是 logOK（cmd={command}），这条连接已放弃",
+                )
             await sock.close()
 
         if tcp_retry_window is not None:
+            _remember_stage(stage_notes, "已跳过 H5 WebSocket：本次指定了只重试 Flash TCP")
             return None
 
         # 策略 1: WebSocket (H5 domain:port)
-        if zone.domain and zone.port > 0:
-            if await sock.connect_ws(zone.domain, zone.port, timeout):
-                resp = await sock.login(
-                    f"{zone.zone_index} {zone.zone_name}",
-                    user_id, session_id
-                )
-                if resp is not None:
-                    retained = True
-                    return sock
+        if not (zone.domain and zone.port > 0):
+            _remember_stage(stage_notes, "H5 WebSocket 未尝试：区服没有 domain 或端口")
+            return None
+        if not await sock.connect_ws(zone.domain, zone.port, timeout):
+            _remember_stage(
+                stage_notes,
+                "H5 WebSocket 未连上：" + (sock.disconnect_reason or "无断开说明"),
+            )
+            return None
+        resp = await sock.login(zone_label, user_id, session_id)
+        if resp is not None:
+            retained = True
+            _remember_stage(stage_notes, "H5 WebSocket 游戏登录已接受")
+            return sock
+        _remember_stage(stage_notes, "H5 WebSocket 已连上，游戏登录没有返回可接受的回包")
         return None
     finally:
         if not retained:

@@ -716,7 +716,7 @@ class SimulatedLoginBoundaryTests(unittest.IsolatedAsyncioTestCase):
             zones = await egg.authenticate(
                 "simulated-account", "simulated-password-value", 1, logs.append
             )
-            await egg.connect(zones[0][0], logs.append)
+            await egg.connect(zones[0].zone_index, logs.append)
         finally:
             os.environ.pop("AOLA_PROXY_URL", None)
             (
@@ -730,6 +730,8 @@ class SimulatedLoginBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(captured["http"]["save_diagnostics"])
         self.assertNotIn("proxy_url", captured["http"])
         self.assertEqual(captured["connect"]["network_mode"], "system")
+        self.assertNotIn("tcp_retry_window", captured["connect"])
+        self.assertIsInstance(captured["connect"].get("stage_notes"), list)
         self.assertNotIn("password", captured["config"])
         self.assertNotIn("session_id", captured["config"])
         joined = "\n".join(logs)
@@ -774,10 +776,304 @@ class SimulatedWindowTests(unittest.TestCase):
             self.assertEqual(str(app.start_button["state"]), "disabled")
             self.assertFalse(app.retry_collect.get())
             self.assertIn("空闲", app.status.get())
+            self.assertEqual(str(app.auth_button["state"]), "disabled")
+            self.assertEqual(str(app.connect_button["state"]), "disabled")
             board = app.board.get("1.0", "end")
             self.assertIn("还没有查询", board)
         finally:
             app._on_close()
+
+
+class SimulatedRoleAndConnectTests(unittest.IsolatedAsyncioTestCase):
+    def test_simulated_choose_role_zero_one_and_many(self) -> None:
+        from src.accounts.login import RoleInfo
+        from src.game.eggs.session import choose_role
+
+        one = RoleInfo(4, "user-a", "小甲")
+        two = RoleInfo(9, "user-b", "小乙")
+        with self.assertRaises(ValueError):
+            choose_role([], None)
+        self.assertEqual(choose_role([one], None).char_id, 4)
+        with self.assertRaises(ValueError):
+            choose_role([one, two], None)
+        self.assertEqual(choose_role([one, two], 9).nickname, "小乙")
+        with self.assertRaises(ValueError):
+            choose_role([one, two], 1)
+
+    def test_simulated_zone_list_uses_login_metadata_only(self) -> None:
+        from src.accounts.login import LoginResult, ZoneData
+        from src.game.eggs.session import format_zone_choice, list_zone_choices
+
+        result = LoginResult(
+            success=True,
+            zone_list=[
+                ZoneData(3, "普伦星", "203.0.113.10", 443, flash_port=8001, domain="h5.example"),
+                ZoneData(8, "无名", "", 0, flash_port=0, domain=""),
+            ],
+        )
+        choices = list_zone_choices(result)
+        self.assertEqual([item.zone_index for item in choices], [3])
+        self.assertTrue(choices[0].has_tcp)
+        self.assertTrue(choices[0].has_h5)
+        self.assertEqual(format_zone_choice(choices[0]), "3 普伦星（TCP/H5）")
+
+    def test_simulated_socket_packet_carries_user_id_not_char_id(self) -> None:
+        from src.protocol.message_codec import build_login_message
+
+        packet = build_login_message("3 普伦星", "user-field", "sid-field")
+        self.assertIn("3 普伦星".encode(), packet)
+        self.assertIn(b"user-field", packet)
+        self.assertIn(b"sid-field", packet)
+        self.assertNotIn(b"charId", packet)
+
+    async def test_simulated_role_query_sends_account_only(self) -> None:
+        from src.accounts import login as login_module
+
+        captured = {}
+
+        class Response:
+            async def read(self):
+                return "7,user-7,星仔|8,user-8,星妹".encode()
+
+            def raise_for_status(self):
+                return None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class Session:
+            def __init__(self, **_kwargs):
+                return None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def post(self, url, data, headers, timeout):
+                captured["url"] = url
+                captured["data"] = data
+                return Response()
+
+        original = login_module.aiohttp.ClientSession
+        login_module.aiohttp.ClientSession = Session
+        try:
+            roles = await login_module.query_roles("simulated-account", network_mode="system")
+        finally:
+            login_module.aiohttp.ClientSession = original
+        self.assertEqual([(role.char_id, role.nickname) for role in roles], [(7, "星仔"), (8, "星妹")])
+        self.assertIn("query_role_info", captured["data"])
+        self.assertIn("duoduoId", captured["data"])
+        self.assertNotIn("password", captured["data"])
+        self.assertNotIn("charId", captured["data"])
+
+    async def test_simulated_role_query_failure_and_empty(self) -> None:
+        from src.accounts import login as login_module
+
+        class Boom:
+            def __init__(self, **_kwargs):
+                return None
+
+            async def __aenter__(self):
+                raise login_module.aiohttp.ClientError("down")
+
+            async def __aexit__(self, *_args):
+                return False
+
+        original = login_module.aiohttp.ClientSession
+        login_module.aiohttp.ClientSession = Boom
+        try:
+            with self.assertRaises(ConnectionError) as raised:
+                await login_module.query_roles("simulated-account", network_mode="system")
+        finally:
+            login_module.aiohttp.ClientSession = original
+        self.assertIn("角色查询请求失败", str(raised.exception))
+
+        class EmptyResponse:
+            async def read(self):
+                return b""
+
+            def raise_for_status(self):
+                return None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class EmptySession(Boom):
+            async def __aenter__(self):
+                return self
+
+            def post(self, *_args, **_kwargs):
+                return EmptyResponse()
+
+        login_module.aiohttp.ClientSession = EmptySession
+        try:
+            with self.assertRaises(ConnectionError) as raised:
+                await login_module.query_roles("simulated-account", network_mode="system")
+        finally:
+            login_module.aiohttp.ClientSession = original
+        self.assertIn("没有可用角色", str(raised.exception))
+
+    async def test_simulated_password_failure_does_not_connect(self) -> None:
+        from src.accounts.login import LoginResult, RoleInfo
+        from src.game.eggs import session as session_module
+
+        calls = []
+
+        async def fake_query(account, **_kwargs):
+            calls.append(("query", account))
+            return [RoleInfo(1, "user-1", "星仔")]
+
+        async def fake_http(*_args, **_kwargs):
+            calls.append("auth")
+            return LoginResult(success=False, error_msg="用户名或密码错误！")
+
+        async def fake_connect(*_args, **_kwargs):
+            calls.append("socket")
+            return None
+
+        originals = (session_module.query_roles, session_module.http_login, session_module.login_and_connect)
+        session_module.query_roles = fake_query
+        session_module.http_login = fake_http
+        session_module.login_and_connect = fake_connect
+        logs = []
+        try:
+            egg = session_module.EggSession()
+            roles = await egg.lookup_roles("simulated-account", logs.append)
+            self.assertEqual(roles[0].char_id, 1)
+            with self.assertRaises(ConnectionError) as raised:
+                await egg.authenticate("simulated-account", "simulated-password-value", 1, logs.append)
+        finally:
+            session_module.query_roles, session_module.http_login, session_module.login_and_connect = originals
+        self.assertIn("账号密码验证失败", str(raised.exception))
+        self.assertNotIn("区服长连接", str(raised.exception))
+        self.assertEqual(calls, [("query", "simulated-account"), "auth"])
+        self.assertNotIn("simulated-password-value", "\n".join(logs))
+
+    async def test_simulated_cancel_stops_before_password_and_socket(self) -> None:
+        from src.accounts.login import RoleInfo
+        from src.game.eggs.session import CancelledStep
+        from src.game.eggs import session as session_module
+
+        calls = []
+
+        async def fake_http(*_args, **_kwargs):
+            calls.append("auth")
+            raise AssertionError("password request")
+
+        async def fake_connect(*_args, **_kwargs):
+            calls.append("socket")
+            raise AssertionError("socket")
+
+        originals = (session_module.http_login, session_module.login_and_connect)
+        session_module.http_login = fake_http
+        session_module.login_and_connect = fake_connect
+        try:
+            egg = session_module.EggSession()
+            egg._roles = [RoleInfo(1, "user-1", "星仔")]
+            egg.request_cancel()
+            with self.assertRaises(CancelledStep):
+                await egg.authenticate("simulated-account", "pw", 1, lambda _m: None)
+            with self.assertRaises(CancelledStep):
+                await egg.connect(3, lambda _m: None)
+        finally:
+            session_module.http_login, session_module.login_and_connect = originals
+        self.assertEqual(calls, [])
+
+    async def test_simulated_tcp_failure_then_h5_and_tcp_only_skip(self) -> None:
+        from src.accounts.login import ZoneData
+        from src.network import socket_client
+
+        calls = []
+
+        class FakeSocket:
+            def __init__(self, *_args, **_kwargs):
+                self.disconnect_reason = ""
+
+            async def connect_tcp(self, host, port, timeout=15.0):
+                calls.append(("tcp", host, port))
+                self.disconnect_reason = "TCP 安全策略等待超过 0.2 秒"
+                return False
+
+            async def connect_ws(self, domain, port, timeout=2):
+                calls.append(("ws", domain, port))
+                self.disconnect_reason = ""
+                return True
+
+            async def login(self, zone, user_id, session_id):
+                calls.append(("login", zone, user_id, session_id))
+                return {"_cmd": "logOK", "id": 7}
+
+            async def close(self):
+                calls.append("close")
+
+        zone = ZoneData(3, "普伦星", "203.0.113.10", 443, flash_port=8001, domain="h5.example")
+        original = socket_client.GameSocket
+        socket_client.GameSocket = FakeSocket
+        try:
+            notes = []
+            sock = await socket_client.login_and_connect(
+                zone, "user-field", "sid-field", network_mode="system", stage_notes=notes
+            )
+            self.assertIsNotNone(sock)
+            self.assertEqual(calls[0], ("tcp", "203.0.113.10", 8001))
+            self.assertEqual(calls[1][0], "ws")
+            self.assertEqual(calls[2][1], "3 普伦星")
+            self.assertEqual(calls[2][2], "user-field")
+            self.assertIn("Flash TCP 未连上", "；".join(notes))
+            calls.clear()
+            skipped = []
+            sock = await socket_client.login_and_connect(
+                zone,
+                "user-field",
+                "sid-field",
+                network_mode="system",
+                tcp_retry_window=0.01,
+                stage_notes=skipped,
+            )
+        finally:
+            socket_client.GameSocket = original
+        self.assertIsNone(sock)
+        self.assertNotIn("ws", [item[0] for item in calls if isinstance(item, tuple)])
+        self.assertIn("已跳过 H5 WebSocket", "；".join(skipped))
+
+    async def test_simulated_connect_reports_stage_when_socket_returns_none(self) -> None:
+        from src.accounts.login import LoginResult, ZoneData
+        from src.game.eggs import session as session_module
+
+        async def fake_connect(*_args, **kwargs):
+            kwargs["stage_notes"].append("Flash TCP 未连上：TCP 安全策略等待超过 0.2 秒")
+            kwargs["stage_notes"].append("H5 WebSocket 未连上：WSS 连接失败")
+            return None
+
+        original = session_module.login_and_connect
+        session_module.login_and_connect = fake_connect
+        logs = []
+        try:
+            egg = session_module.EggSession()
+            egg._login = LoginResult(
+                success=True,
+                user_id="user-field",
+                session_id="sid-field",
+                zone_list=[ZoneData(3, "普伦星", "203.0.113.10", 443, flash_port=8001, domain="h5.example")],
+            )
+            with self.assertRaises(ConnectionError) as raised:
+                await egg.connect(3, logs.append)
+        finally:
+            session_module.login_and_connect = original
+        message = str(raised.exception)
+        self.assertIn("区服长连接登录失败", message)
+        self.assertIn("Flash TCP 未连上", message)
+        self.assertIn("H5 WebSocket 未连上", message)
+        self.assertNotIn("sid-field", message)
+        self.assertNotIn("user-field", "\n".join(logs))
 
 
 if __name__ == "__main__":

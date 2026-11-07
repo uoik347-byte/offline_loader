@@ -11,7 +11,7 @@ from src.config import PROJECT_ROOT
 from src.game.eggs.engine import EggEngine
 from src.game.eggs.presenter import can_start, confirmation_text, format_board
 from src.game.eggs.protocol import public_error
-from src.game.eggs.session import EggSession
+from src.game.eggs.session import CancelledStep, EggSession, format_zone_choice
 from src.game.eggs.store import JsonHoldStore
 from src.game.eggs.transport import ContextTransport
 
@@ -23,17 +23,21 @@ class EggApp:
         self.root.geometry("820x680")
         self.session = EggSession()
         self.store = JsonHoldStore(store_path or (PROJECT_ROOT / "egg-hatch-local-state.json"))
+        self._roles: list[tuple[int, str]] = []
+        self._zones: list[tuple[int, str]] = []
+        self._busy = False
+        self._op = 0
+        self._future = None
         self.engine: EggEngine | None = None
         self.query = None
         self.running = False
-        self._zones: list[tuple[int, str]] = []
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         self._log_path = log_path or (PROJECT_ROOT / "logs" / "egg-hatch-ui.log")
         self._build()
         self._refresh_view()
-        self._log("程序已打开，当前空闲。不会自动孵化或收取。")
+        self._log("程序已打开，当前空闲。不会自动孵化或收取。请先查询角色。")
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
@@ -47,22 +51,28 @@ class EggApp:
         login.pack(fill=tk.X)
         self.account = tk.StringVar()
         self.password = tk.StringVar()
-        self.char_id = tk.StringVar()
+        self.role = tk.StringVar()
         self.zone = tk.StringVar()
-        self.status = tk.StringVar(value="空闲")
+        self.status = tk.StringVar(value="空闲：尚未查询角色")
         _field(login, 0, "账号", self.account, secret=False)
         _field(login, 1, "密码", self.password, secret=True)
-        _field(login, 2, "角色 ID", self.char_id, secret=False)
+        ttk.Label(login, text="角色").grid(row=2, column=0, sticky=tk.W, pady=4)
+        self.role_box = ttk.Combobox(login, textvariable=self.role, state="readonly", width=42)
+        self.role_box.grid(row=2, column=1, sticky=tk.W)
         ttk.Label(login, text="区服").grid(row=3, column=0, sticky=tk.W, pady=4)
         self.zone_box = ttk.Combobox(login, textvariable=self.zone, state="readonly", width=42)
         self.zone_box.grid(row=3, column=1, sticky=tk.W)
         buttons = ttk.Frame(login)
         buttons.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=6)
-        self.login_button = ttk.Button(buttons, text="登录", command=self._on_login)
-        self.connect_button = ttk.Button(buttons, text="连接", command=self._on_connect)
+        self.lookup_button = ttk.Button(buttons, text="查询角色", command=self._on_lookup)
+        self.auth_button = ttk.Button(buttons, text="验证登录", command=self._on_auth)
+        self.connect_button = ttk.Button(buttons, text="连接区服", command=self._on_connect)
+        self.cancel_button = ttk.Button(buttons, text="取消", command=self._on_cancel)
         self.disconnect_button = ttk.Button(buttons, text="断开", command=self._on_disconnect)
-        self.login_button.pack(side=tk.LEFT, padx=(0, 6))
+        self.lookup_button.pack(side=tk.LEFT, padx=(0, 6))
+        self.auth_button.pack(side=tk.LEFT, padx=(0, 6))
         self.connect_button.pack(side=tk.LEFT, padx=(0, 6))
+        self.cancel_button.pack(side=tk.LEFT, padx=(0, 6))
         self.disconnect_button.pack(side=tk.LEFT)
 
         work = ttk.LabelFrame(frame, text="蛋", padding=8)
@@ -94,14 +104,19 @@ class EggApp:
 
     def _refresh_view(self) -> None:
         connected = self.session.connected
-        self.connect_button.configure(state=_enabled(bool(self._zones) and not self.running))
-        self.login_button.configure(state=_enabled(not self.running))
-        self.query_button.configure(state=_enabled(connected and not self.running))
+        verified = self.session.password_verified
+        self.lookup_button.configure(state=_enabled(not self._busy and not self.running))
+        self.auth_button.configure(state=_enabled(bool(self._roles) and not self._busy and not self.running))
+        self.connect_button.configure(
+            state=_enabled(verified and bool(self._zones) and not self._busy and not self.running)
+        )
+        self.cancel_button.configure(state=_enabled(self._busy))
+        self.query_button.configure(state=_enabled(connected and not self.running and not self._busy))
         self.start_button.configure(
-            state=_enabled(can_start(connected, self.query, self.store.ok, self.running))
+            state=_enabled(can_start(connected, self.query, self.store.ok, self.running or self._busy))
         )
         self.stop_button.configure(state=_enabled(self.running))
-        self.disconnect_button.configure(state=_enabled(connected or self.running))
+        self.disconnect_button.configure(state=_enabled((connected or self.running) and not self._busy))
         _set_text(self.board, format_board(self.query, self.store))
 
     def _log(self, message: str) -> None:
@@ -116,38 +131,79 @@ class EggApp:
     def _call(self, coro):
         return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
-    def _on_login(self) -> None:
+    def _on_lookup(self) -> None:
+        account = self.account.get().strip()
+        if not account:
+            self._log("请填写账号。查询角色不会发送密码。")
+            return
+        self.session.cancel_requested = False
+        self._busy = True
+        self.status.set("正在查询角色，尚未验证密码")
+        self._refresh_view()
+
+        async def action():
+            return await self.session.lookup_roles(account, self._thread_log)
+
+        self._submit(action(), self._lookup_done, "角色查询失败")
+
+    def _lookup_done(self, roles) -> None:
+        self._roles = [(role.char_id, role.nickname) for role in roles]
+        labels = [f"{nickname}（{char_id}）" for char_id, nickname in self._roles]
+        self.role_box.configure(values=labels)
+        if len(self._roles) == 1:
+            self.role.set(labels[0])
+            self.status.set("已找到 1 个角色并自动选中。密码尚未验证。")
+        else:
+            self.role.set("")
+            self.status.set(f"已找到 {len(self._roles)} 个角色，请选择后再验证密码。")
+        self._zones = []
+        self.zone_box.configure(values=[])
+        self.zone.set("")
+        self.query = None
+        self._refresh_view()
+
+    def _on_auth(self) -> None:
+        char_id = _selected_role(self.role.get(), self._roles)
+        if char_id is None:
+            self._log("请先选择角色。查询成功并不表示密码已验证。")
+            return
         account = self.account.get().strip()
         password = self.password.get()
         self.password.set("")
-        try:
-            char_id = int(self.char_id.get().strip())
-        except ValueError:
-            self._log("角色 ID 必须是整数。")
+        if not password:
+            self._log("请填写密码。角色查询成功并不表示密码已验证。")
             return
-        self.status.set("正在登录")
+        self.session.cancel_requested = False
+        self._busy = True
+        self.status.set("正在验证账号密码")
         self._refresh_view()
 
         async def action():
             return await self.session.authenticate(account, password, char_id, self._thread_log)
 
-        self._submit(action(), self._login_done)
+        self._submit(action(), self._auth_done, "账号密码验证失败")
 
-    def _login_done(self, zones: list[tuple[int, str]]) -> None:
-        self._zones = zones
-        self.zone_box.configure(values=[f"{index} {name}" for index, name in zones])
-        if zones:
-            self.zone.set(f"{zones[0][0]} {zones[0][1]}")
+    def _auth_done(self, zones) -> None:
+        self._zones = [(zone.zone_index, format_zone_choice(zone)) for zone in zones]
+        labels = [label for _index, label in self._zones]
+        self.zone_box.configure(values=labels)
+        if len(self._zones) == 1:
+            self.zone.set(labels[0])
+        else:
+            self.zone.set("")
         self.query = None
-        self.status.set("已登录，请选择区服并连接")
+        self.status.set("密码已验证。请选择区服后再连接。")
         self._refresh_view()
 
     def _on_connect(self) -> None:
-        zone_index = _selected_zone(self.zone.get())
+        zone_index = _selected_zone(self.zone.get(), self._zones)
         if zone_index is None:
-            self._log("请选择区服。")
+            self._log("请选择本次登录返回的区服。")
             return
-        self.status.set("正在连接")
+        self.session.cancel_requested = False
+        self._busy = True
+        self.status.set("正在连接区服")
+        self._refresh_view()
 
         async def action():
             await self.session.connect(zone_index, self._thread_log)
@@ -157,7 +213,18 @@ class EggApp:
                 log=self._thread_log,
             )
 
-        self._submit(action(), lambda _value: self._set_idle("已连接，空闲"))
+        self._submit(action(), lambda _value: self._set_idle("已连接，空闲"), "区服长连接失败")
+
+    def _on_cancel(self) -> None:
+        self.session.request_cancel()
+        future = self._future
+        if future is not None:
+            future.cancel()
+        self._op += 1
+        self._busy = False
+        self.status.set("已取消，没有继续下一步")
+        self._log("已取消当前步骤。")
+        self._refresh_view()
 
     def _on_disconnect(self) -> None:
         if self.engine is not None:
@@ -256,18 +323,34 @@ class EggApp:
     def _thread_log(self, message: str) -> None:
         self.root.after(0, lambda: self._log(message))
 
-    def _submit(self, coro, done) -> None:
+    def _submit(self, coro, done, failure_status: str = "出现错误，空闲") -> None:
+        self._op += 1
+        token = self._op
         future = self._call(coro)
+        self._future = future
 
         def poll() -> None:
+            if token != self._op:
+                return
             if not future.done():
                 self.root.after(100, poll)
                 return
+            self._busy = False
+            self._future = None
             try:
                 value = future.result()
+            except asyncio.CancelledError:
+                self.status.set("已取消，没有继续下一步")
+                self._refresh_view()
+                return
+            except CancelledStep as exc:
+                self.status.set("已取消，没有继续下一步")
+                self._log(str(exc))
+                self._refresh_view()
+                return
             except Exception as exc:
                 self.running = False
-                self.status.set("出现错误，空闲")
+                self.status.set(failure_status)
                 self._log(public_error(exc))
                 self._refresh_view()
                 return
@@ -286,10 +369,17 @@ def _enabled(value: bool) -> str:
     return tk.NORMAL if value else tk.DISABLED
 
 
-def _selected_zone(text: str) -> int | None:
-    head = text.strip().split(" ", 1)[0]
-    if head.isdigit():
-        return int(head)
+def _selected_role(text: str, roles: list[tuple[int, str]]) -> int | None:
+    for char_id, nickname in roles:
+        if text == f"{nickname}（{char_id}）":
+            return char_id
+    return None
+
+
+def _selected_zone(text: str, zones: list[tuple[int, str]]) -> int | None:
+    for zone_index, label in zones:
+        if text == label:
+            return zone_index
     return None
 
 

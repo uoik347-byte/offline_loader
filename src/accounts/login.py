@@ -303,6 +303,53 @@ def _save_login_failure(stage, request_url, response, body, error, account, pass
     return f"{redact(error)}；{analysis}；诊断文件：{metadata_path}"
 
 
+async def query_roles(
+    account: str,
+    *,
+    register_url: Optional[str] = None,
+    timeout: Optional[float] = None,
+    network_mode: str = "system",
+) -> list[RoleInfo]:
+    """Look up roles with the account id only. This does not send or check a password."""
+    if not isinstance(account, str) or not account.strip():
+        raise ValueError("请填写账号")
+    account = account.strip()
+    conf = {} if network_mode == "system" else load_user_config()
+    if register_url is None:
+        register_url = conf.get("register_url", default_config()["register_url"])
+    request_timeout = aiohttp.ClientTimeout(
+        total=float(timeout if timeout is not None else conf.get("timeout", 30))
+    )
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Origin": "https://aola.100bt.com",
+        "Referer": "https://aola.100bt.com/",
+    }
+    from src.network.proxy import process_proxy, proxy_connector
+    effective_proxy = None if network_mode == "system" else process_proxy()
+    session_options = {"connector": proxy_connector(effective_proxy)} if effective_proxy else {}
+    if network_mode == "system":
+        session_options["trust_env"] = False
+    try:
+        async with aiohttp.ClientSession(**session_options) as session:
+            async with session.post(
+                register_url,
+                data=urllib.parse.urlencode({"type": "query_role_info", "duoduoId": account}),
+                headers=headers,
+                timeout=request_timeout,
+            ) as response:
+                body = await response.read()
+                response.raise_for_status()
+                text = body.decode("utf-8", errors="replace")
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        raise ConnectionError(f"角色查询请求失败：{type(exc).__name__}") from exc
+    try:
+        return parse_role_response(text)
+    except ValueError as exc:
+        raise ConnectionError(f"角色查询结果无法识别：{exc}") from exc
+
+
 async def http_login(
     account: str,
     password: str,
