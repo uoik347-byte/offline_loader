@@ -91,6 +91,7 @@ class EggEngine:
         self.watch: dict[int, float] = {}
         self._queue: list[int] = []
         self.collected_ids: list[int] = []
+        self.absent_unconfirmed: list[int] = []
         self._fresh = False
         self._fresh_ids: set[int] = set()
         self._fresh_pending: list[PendingEgg] = []
@@ -196,7 +197,7 @@ class EggEngine:
             ready = self._ready_record()
             if ready is not None:
                 outcome = await self._collect(ready)
-                if outcome in {"collected", "skipped"}:
+                if outcome in {"collected", "skipped", "absent"}:
                     continue
                 return self._finish_outcome(outcome)
             if self._unmapped():
@@ -565,6 +566,8 @@ class EggEngine:
             self.log("收取指令没有发出。")
             return result.kind
         if result.kind != "message":
+            if result.kind == "timeout":
+                return await self._reconcile_collect_timeout(record, pmid, slot)
             self._mark_collect_uncertain(record, pmid, slot)
             self.log(
                 f"eggId={egg_id} 的收取回执不确定（{result.kind}）。不再发送 1223。"
@@ -584,8 +587,65 @@ class EggEngine:
         self.store.remove(egg_id)
         self.watch.pop(egg_id, None)
         self.collected_ids.append(egg_id)
-        self.log(f"收取已确认：eggId={egg_id} 已从 1-8 列表消失。")
+        self.log(f"收取已确认：eggId={egg_id} 回执已对齐，并已从随后的 1-8 消失。")
         return "collected"
+
+    async def _reconcile_collect_timeout(self, record: dict, pmid: int, slot: int | None) -> str:
+        """One read-only 1-8 after a missed 2223. Absence is not a confirmed collect."""
+        egg_id = int(record["egg_id"])
+        status = await self._fetch_status()
+        if not status.ok or status.pending is None:
+            self._mark_collect_uncertain(record, pmid, slot)
+            self.log(f"eggId={egg_id} 收取回执超时，随后的 1-8 未知。格子继续占用。不再发送 1223。")
+            return "uncertain"
+        if any(egg.egg_id == egg_id for egg in status.pending):
+            latest = self.store.get(egg_id) or record
+            self._mark_collect_uncertain(latest, pmid, slot)
+            self.log(f"eggId={egg_id} 收取回执超时，蛋仍在 1-8。不再发送 1223。")
+            return "uncertain"
+        if self._other_uncertain(egg_id):
+            self._audit_collect(record, pmid, slot, free_slot=False)
+            self.log(
+                f"eggId={egg_id} 收取回执超时，列表里没有它。"
+                "还有其他未确认发送，先暂停。这不是已确认收取。"
+            )
+            return "uncertain"
+        self._audit_collect(record, pmid, slot, free_slot=True)
+        self.absent_unconfirmed.append(egg_id)
+        self.log(
+            f"eggId={egg_id} 收取回执超时。随后的 1-8 里没有它，格子已释放。"
+            "这不是已确认收取，不会重发 1223。"
+        )
+        return "absent"
+
+    def _other_uncertain(self, egg_id: int) -> bool:
+        for other_id, record in self.store.records.items():
+            if other_id == egg_id:
+                continue
+            if record.get("phase") in {
+                "hatch_inflight",
+                "collect_inflight",
+                "hatch_uncertain",
+                "collect_uncertain",
+            }:
+                return True
+        return False
+
+    def _audit_collect(self, record: dict, pmid: int, slot: int | None, *, free_slot: bool) -> None:
+        self.store.upsert(
+            {
+                "egg_id": record["egg_id"],
+                "slot": None if free_slot else (slot if slot in SLOT_IDS else record.get("slot")),
+                "pmid": pmid,
+                "st": None,
+                "phase": "audit_absent",
+                "hatch_sent": bool(record.get("hatch_sent")),
+                "collect_blocked": True,
+            }
+        )
+        if free_slot:
+            self.watch.pop(int(record["egg_id"]), None)
+        self._publish_board()
 
     def _mark(self, egg_id: int, slot: int, phase: str, *, hatch_sent: bool) -> None:
         current = self.store.get(egg_id) or {}

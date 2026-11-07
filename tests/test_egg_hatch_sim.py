@@ -260,7 +260,8 @@ class SimulatedEggTests(unittest.IsolatedAsyncioTestCase):
         world.extra_on_unhatched = {"_cmd": "2223", "id": 50}
         engine, transport = _engine(world)
         report = await engine.run(confirmed=True)
-        self.assertEqual(_cmds(transport), ["1-8", "1=1", "1223"])
+        self.assertEqual(_cmds(transport).count("1223"), 1)
+        self.assertEqual(_cmds(transport)[:3], ["1-8", "1=1", "1223"])
         self.assertNotIn(5, report.collected_ids)
         self.assertTrue(engine.store.collect_blocked(50))
         again, transport2 = _engine(world)
@@ -624,6 +625,79 @@ class SimulatedEggTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("eggId=12", text)
         self.assertNotIn("格 2：eggId=12", text)
         self.assertNotIn("格 3：eggId=12", text)
+
+    async def test_simulated_collect_ack_timeout_then_empty_frees_slot_without_confirming(self) -> None:
+        world = World()
+        world.unhatched = [10, 11]
+        engine, transport = _engine(world)
+        logs: list[str] = []
+        engine.log = logs.append
+        base = transport.on_send
+
+        late = {"on": False}
+
+        def dispatch(ext, cmd, param):
+            if cmd == "1223" and param["id"] == 8010:
+                world.pending.pop(10, None)
+                world.st.pop(10, None)
+                late["on"] = True
+                return
+            if cmd == "1-8" and late["on"]:
+                transport.push({"_cmd": "2223", "id": 8010})
+                late["on"] = False
+            base(ext, cmd, param)
+
+        transport.on_send = dispatch
+        report = await engine.run(confirmed=True)
+        sent_ids = [param.get("id") for _e, cmd, param in transport.sent if cmd == "1223"]
+        self.assertEqual(sent_ids.count(8010), 1)
+        self.assertNotIn(10, report.collected_ids)
+        self.assertIn(10, engine.absent_unconfirmed)
+        self.assertEqual(engine.store.get(10)["phase"], "audit_absent")
+        self.assertIsNone(engine.store.get(10)["slot"])
+        self.assertIn(11, [param["eggId"] for _e, cmd, param in transport.sent if cmd == "1-4"])
+        self.assertTrue(any("不是已确认收取" in line for line in logs))
+
+    async def test_simulated_collect_ack_timeout_still_present_or_unknown_pauses(self) -> None:
+        world = World()
+        world.pending = {5: 50}
+        world.st[5] = 100
+        world.unhatched = [10]
+        world.ack = False
+        engine, transport = _engine(world)
+        report = await engine.run(confirmed=True)
+        self.assertEqual(_cmds(transport).count("1223"), 1)
+        self.assertEqual(report.collected_ids, [])
+        self.assertEqual(engine.absent_unconfirmed, [])
+        self.assertTrue(engine.store.collect_blocked(50))
+        self.assertNotIn("1-4", _cmds(transport))
+        self.assertEqual(report.kind, "uncertain")
+
+        world.drop_status = False
+        world2 = World()
+        world2.pending = {6: 60}
+        world2.st[6] = 100
+        world2.unhatched = []
+        world2.ack = False
+        world2.drop_status = False
+        engine2, transport2 = _engine(world2)
+        base = transport2.on_send
+        seen = {"collect": False}
+
+        def dispatch(ext, cmd, param):
+            if cmd == "1223":
+                seen["collect"] = True
+                return
+            if cmd == "1-8" and seen["collect"]:
+                world2.drop_status = True
+            base(ext, cmd, param)
+
+        transport2.on_send = dispatch
+        report2 = await engine2.run(confirmed=True)
+        self.assertEqual(_cmds(transport2).count("1223"), 1)
+        self.assertEqual(report2.kind, "uncertain")
+        self.assertEqual(engine2.absent_unconfirmed, [])
+        self.assertTrue(engine2.store.collect_blocked(60))
 
     def test_simulated_public_error_redacts_assignment(self) -> None:
         text = public_error(RuntimeError("password=simulated-password-value"))
