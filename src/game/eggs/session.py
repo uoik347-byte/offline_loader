@@ -179,7 +179,13 @@ class EggSession:
         self._check_cancel()
         if socket is None:
             detail = "；".join(notes) if notes else "没有记录到失败阶段"
-            raise ConnectionError(f"区服长连接登录失败。{detail}")
+            summary = result.server_parse_summary or "没有区服解析统计"
+            raise ConnectionError(
+                f"区服长连接登录失败。{detail}。{format_zone_choice(ZoneChoice(zone.zone_index, zone.zone_name or '未命名', bool(zone.host and zone.flash_port > 0), bool(zone.domain and zone.port > 0)))}。"
+                f"解析字段 server_index={zone.server_index} host={zone.host or '空'} "
+                f"flash_port={zone.flash_port} h5_port={zone.port} "
+                f"domain={zone.domain.strip() or '空'}。{summary}"
+            )
         router = MessageRouter(socket)
         context = AppContext(
             {

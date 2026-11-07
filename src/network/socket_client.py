@@ -45,6 +45,17 @@ _pack_int = pack_int
 logger = logging.getLogger(__name__)
 
 
+# One request, then one bounded read. A missing or denying policy still stops TCP.
+POLICY_FILE_REQUEST = b"<policy-file-request/>\x00"
+DEFAULT_POLICY_TIMEOUT = 5.0
+
+
+def bounded_policy_timeout(timeout: float | None) -> float:
+    if timeout is None:
+        return DEFAULT_POLICY_TIMEOUT
+    return min(15.0, max(0.5, float(timeout)))
+
+
 def _policy_allows_game_socket(policy: bytes, port: int) -> bool:
     try:
         root = ET.fromstring(policy)
@@ -66,6 +77,32 @@ def _policy_allows_game_socket(policy: bytes, port: int) -> bool:
                 if int(bounds[0]) <= port <= int(bounds[1]):
                     return True
     return False
+
+
+async def _read_nul_terminated(readexactly, timeout: float) -> bytes:
+    policy = bytearray()
+    async with asyncio.timeout(timeout):
+        while True:
+            chunk = await readexactly(1)
+            if chunk[0] == 0:
+                return bytes(policy)
+            policy.append(chunk[0])
+            if len(policy) > 65536:
+                raise ValueError("安全策略过长")
+
+
+def endpoint_facts(zone) -> str:
+    domain = str(getattr(zone, "domain", "") or "").strip()
+    host = str(getattr(zone, "host", "") or "").strip()
+    if len(host) > 80:
+        host = host[:80] + "…"
+    if len(domain) > 80:
+        domain = domain[:80] + "…"
+    return (
+        f"server_index={getattr(zone, 'server_index', -1)} "
+        f"host={host or '空'} flash_port={getattr(zone, 'flash_port', 0)} "
+        f"h5_port={getattr(zone, 'port', 0)} domain={domain or '空'}"
+    )
 
 
 class GameSocket:
@@ -104,8 +141,14 @@ class GameSocket:
     def connected(self) -> bool:
         return self._connected
 
-    async def connect_tcp(self, host: str, port: int, timeout: float = 15.0) -> bool:
-        """原始 TCP 连接 (Flash 端口)"""
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float = 15.0,
+        policy_timeout: float | None = None,
+    ) -> bool:
+        """原始 TCP 连接 (Flash 端口)。先请求并校验跨域策略，不允许则停止。"""
         try:
             if self.proxy_url:
                 from src.network.proxy import proxy_socket
@@ -127,26 +170,29 @@ class GameSocket:
             self.active_room_id = -1
             self.active_room_name = ""
             print(f"[TCP] Transport established to {host}:{port}")
-            # 读取 Flash 安全策略文件
+            wait = bounded_policy_timeout(policy_timeout)
             try:
-                policy = bytearray()
-                async with asyncio.timeout(0.2):
-                    while True:
-                        b = await self._reader.readexactly(1)
-                        if b[0] == 0: break
-                        policy.append(b[0])
-                if not _policy_allows_game_socket(bytes(policy), port):
-                    self.disconnect_reason = "TCP 安全策略无效或未允许当前游戏域名及端口"
-                    await self.close()
-                    print(f"[TCP] Connection failed: {self.disconnect_reason}")
-                    return False
-                print(f"[TCP] Policy: {policy.decode('ascii', errors='replace')[:200]}")
+                self._writer.write(POLICY_FILE_REQUEST)
+                await self._writer.drain()
+                policy = await _read_nul_terminated(self._reader.readexactly, wait)
             except asyncio.TimeoutError:
-                self.disconnect_reason = "TCP 安全策略等待超过 0.2 秒"
+                self.disconnect_reason = (
+                    f"TCP 安全策略等待超过 {wait:g} 秒，未收到以空字节结束的策略，已停止连接"
+                )
                 await self.close()
                 print(f"[TCP] Connection failed: {self.disconnect_reason}")
                 return False
-            print(f"[TCP] Connected to {host}:{port}")
+            except ValueError:
+                self.disconnect_reason = "TCP 安全策略无效或过长，已停止连接"
+                await self.close()
+                print(f"[TCP] Connection failed: {self.disconnect_reason}")
+                return False
+            if not _policy_allows_game_socket(policy, port):
+                self.disconnect_reason = "TCP 安全策略无效或未允许当前游戏域名及端口，已停止连接"
+                await self.close()
+                print(f"[TCP] Connection failed: {self.disconnect_reason}")
+                return False
+            print(f"[TCP] Policy accepted for port {port}")
             return True
         except asyncio.IncompleteReadError as e:
             self.disconnect_reason = (
@@ -765,6 +811,7 @@ async def login_and_connect(
     network_mode: str = "legacy",
     tcp_retry_window: float | None = None,
     stage_notes: list[str] | None = None,
+    policy_timeout: float | None = None,
 ) -> GameSocket | None:
     """TCP/WSS login; a retry window selects TCP only and retries before sending login.
 
@@ -784,12 +831,20 @@ async def login_and_connect(
             connected = False
             _remember_stage(stage_notes, "Flash TCP 未尝试：区服没有 host 或端口")
         else:
-            connected = (await _connect_tcp_with_retry(sock, zone.host, tcp_port, timeout, tcp_retry_window)
-                         if tcp_retry_window is not None else await sock.connect_tcp(zone.host, tcp_port, timeout))
+            connected = (
+                await _connect_tcp_with_retry(sock, zone.host, tcp_port, timeout, tcp_retry_window)
+                if tcp_retry_window is not None
+                else await sock.connect_tcp(
+                    zone.host, tcp_port, timeout, policy_timeout=policy_timeout
+                )
+            )
             if not connected:
                 _remember_stage(
                     stage_notes,
-                    "Flash TCP 未连上：" + (sock.disconnect_reason or "无断开说明"),
+                    "Flash TCP 未连上："
+                    + (sock.disconnect_reason or "无断开说明")
+                    + "。"
+                    + endpoint_facts(zone),
                 )
         if connected:
             resp = await sock.login(zone_label, user_id, session_id)
@@ -816,7 +871,11 @@ async def login_and_connect(
 
         # 策略 1: WebSocket (H5 domain:port)
         if not (zone.domain and zone.port > 0):
-            _remember_stage(stage_notes, "H5 WebSocket 未尝试：区服没有 domain 或端口")
+            _remember_stage(
+                stage_notes,
+                "H5 WebSocket 未尝试：解析结果没有同时具备 domain 和 h5 端口。"
+                + endpoint_facts(zone),
+            )
             return None
         if not await sock.connect_ws(zone.domain, zone.port, timeout):
             _remember_stage(

@@ -997,7 +997,7 @@ class SimulatedRoleAndConnectTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self, *_args, **_kwargs):
                 self.disconnect_reason = ""
 
-            async def connect_tcp(self, host, port, timeout=15.0):
+            async def connect_tcp(self, host, port, timeout=15.0, policy_timeout=None):
                 calls.append(("tcp", host, port))
                 self.disconnect_reason = "TCP 安全策略等待超过 0.2 秒"
                 return False
@@ -1074,6 +1074,149 @@ class SimulatedRoleAndConnectTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("H5 WebSocket 未连上", message)
         self.assertNotIn("sid-field", message)
         self.assertNotIn("user-field", "\n".join(logs))
+
+    def test_simulated_server_records_keep_flash_when_h5_missing(self) -> None:
+        from src.accounts.login import parse_login_response
+
+        xml = """<r><c>ok</c><d>acc</d><u>user-1</u><sid>sid-1</sid>
+<svr>203.0.113.10:8001:0:;203.0.113.11:8001:443:h5.example;203.0.113.12:8001:443;203.0.113.13:8001:443:h5.example:extra</svr>
+<zn>59 库斯特星/0/0/0/0/0/1;39 伊莎女王星/1/0/0/0/0/2;7 跳过/2/0/0/0/0/3</zn></r>"""
+        result = parse_login_response(xml)
+        self.assertTrue(result.success)
+        by_index = {zone.zone_index: zone for zone in result.zone_list}
+        flash_only = by_index[59]
+        self.assertEqual(flash_only.host, "203.0.113.10")
+        self.assertEqual(flash_only.flash_port, 8001)
+        self.assertEqual(flash_only.port, 0)
+        self.assertEqual(flash_only.domain, "")
+        self.assertEqual(flash_only.zone_name, "库斯特星")
+        both = by_index[39]
+        self.assertEqual(both.domain, "h5.example")
+        self.assertEqual(both.port, 443)
+        self.assertNotIn(7, by_index)
+        self.assertIn("3 字段 1 条", result.server_parse_summary)
+        self.assertIn("5 字段 1 条", result.server_parse_summary)
+        self.assertNotIn("sid-1", result.server_parse_summary)
+
+    async def test_simulated_missing_h5_does_not_invent_websocket(self) -> None:
+        from src.accounts.login import ZoneData
+        from src.network import socket_client
+
+        calls = []
+
+        class FakeSocket:
+            def __init__(self, *_args, **_kwargs):
+                self.disconnect_reason = "TCP 安全策略等待超过 5 秒，未收到以空字节结束的策略，已停止连接"
+
+            async def connect_tcp(self, host, port, timeout=15.0, policy_timeout=None):
+                calls.append(("tcp", host, port, policy_timeout))
+                return False
+
+            async def connect_ws(self, domain, port, timeout=2):
+                calls.append(("ws", domain, port))
+                return True
+
+            async def login(self, *_args):
+                raise AssertionError("login")
+
+            async def close(self):
+                return None
+
+        zone = ZoneData(59, "库斯特星", "203.0.113.10", 0, flash_port=8001, domain="", server_index=0)
+        original = socket_client.GameSocket
+        socket_client.GameSocket = FakeSocket
+        try:
+            notes = []
+            sock = await socket_client.login_and_connect(
+                zone, "user-field", "sid-field", network_mode="system", stage_notes=notes
+            )
+        finally:
+            socket_client.GameSocket = original
+        self.assertIsNone(sock)
+        self.assertEqual(calls, [("tcp", "203.0.113.10", 8001, None)])
+        text = "；".join(notes)
+        self.assertIn("h5_port=0", text)
+        self.assertIn("domain=空", text)
+        self.assertIn("host=203.0.113.10", text)
+        self.assertNotIn("ws", [item[0] for item in calls])
+
+    async def test_simulated_policy_timeout_and_delayed_allow(self) -> None:
+        from src.network.socket_client import (
+            POLICY_FILE_REQUEST,
+            _policy_allows_game_socket,
+            _read_nul_terminated,
+            bounded_policy_timeout,
+        )
+
+        allow = (
+            b'<cross-domain-policy><allow-access-from domain="*" to-ports="8001"/>'
+            b"</cross-domain-policy>\x00"
+        )
+        deny = (
+            b'<cross-domain-policy><allow-access-from domain="*" to-ports="1"/>'
+            b"</cross-domain-policy>\x00"
+        )
+
+        class Reader:
+            def __init__(self, data: bytes, delay: float) -> None:
+                self.data = data
+                self.delay = delay
+                self.index = 0
+
+            async def readexactly(self, count: int) -> bytes:
+                if self.delay:
+                    await asyncio.sleep(self.delay)
+                    self.delay = 0
+                if self.index + count > len(self.data):
+                    raise asyncio.IncompleteReadError(self.data[self.index :], count)
+                chunk = self.data[self.index : self.index + count]
+                self.index += count
+                return chunk
+
+        with self.assertRaises(TimeoutError):
+            await _read_nul_terminated(Reader(allow, 0.05).readexactly, 0.01)
+        received = await _read_nul_terminated(Reader(allow, 0.05).readexactly, 1)
+        self.assertTrue(_policy_allows_game_socket(received, 8001))
+        self.assertFalse(_policy_allows_game_socket(received, 9))
+        self.assertFalse(_policy_allows_game_socket(deny[:-1], 8001))
+        self.assertEqual(bounded_policy_timeout(None), 5.0)
+        self.assertEqual(bounded_policy_timeout(0.1), 0.5)
+        self.assertEqual(bounded_policy_timeout(30), 15.0)
+        self.assertTrue(POLICY_FILE_REQUEST.endswith(b"\x00"))
+
+    async def test_simulated_local_policy_exchange_once(self) -> None:
+        from src.network.socket_client import POLICY_FILE_REQUEST, GameSocket
+
+        seen = {"request": b"", "connects": 0}
+
+        async def handle(reader, writer):
+            seen["connects"] += 1
+            seen["request"] = await reader.readuntil(b"\x00")
+            await asyncio.sleep(0.05)
+            port = writer.get_extra_info("sockname")[1]
+            body = (
+                f'<cross-domain-policy><allow-access-from domain="*" to-ports="{port}"/>'
+                f"</cross-domain-policy>\x00"
+            )
+            writer.write(body.encode())
+            await writer.drain()
+            await asyncio.sleep(0.2)
+            writer.close()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        socket = GameSocket("simulated-session-value", network_mode="system")
+        try:
+            accepted = await socket.connect_tcp(
+                "127.0.0.1", port, timeout=2, policy_timeout=1
+            )
+            self.assertTrue(accepted)
+            self.assertEqual(seen["request"], POLICY_FILE_REQUEST)
+            self.assertEqual(seen["connects"], 1)
+        finally:
+            await socket.close()
+            server.close()
+            await server.wait_closed()
 
 
 if __name__ == "__main__":

@@ -29,16 +29,41 @@ class ServerEndpoint:
 
 
 def parse_server_list(text: str) -> list[ServerEndpoint]:
-    servers = []
-    for index, entry in enumerate(text.split(";")):
-        parts = entry.strip().split(":")
+    servers, _summary = parse_server_list_report(text)
+    return servers
+
+
+def parse_server_list_report(text: str) -> tuple[list[ServerEndpoint], str]:
+    """Parse ``host:flash端口:h5端口:domain``. Other colon counts are counted and ignored."""
+    servers: list[ServerEndpoint] = []
+    field_counts: dict[int, int] = {}
+    bad_ports = 0
+    for index, raw in enumerate(text.split(";")):
+        entry = raw.strip()
+        if not entry:
+            continue
+        parts = entry.split(":")
+        field_counts[len(parts)] = field_counts.get(len(parts), 0) + 1
         if len(parts) != 4:
             continue
         try:
-            servers.append(ServerEndpoint(index, parts[0], int(parts[1]), int(parts[2]), parts[3]))
+            flash_port = int(parts[1])
+            h5_port = int(parts[2])
         except ValueError:
+            bad_ports += 1
             continue
-    return servers
+        servers.append(ServerEndpoint(index, parts[0], flash_port, h5_port, parts[3]))
+    summary = [f"接受 host:flash端口:h5端口:domain 共 {len(servers)} 条"]
+    skipped = [
+        f"{count} 字段 {field_counts[count]} 条"
+        for count in sorted(field_counts)
+        if count != 4
+    ]
+    if skipped:
+        summary.append("未按该四段格式忽略 " + "、".join(skipped))
+    if bad_ports:
+        summary.append(f"端口不是整数 {bad_ports} 条")
+    return servers, "；".join(summary)
 
 
 @dataclass
@@ -65,6 +90,7 @@ class LoginResult:
     error_msg: str = ""
     blocked_reason: str = ""
     server_list: list[ServerEndpoint] = field(default_factory=list)
+    server_parse_summary: str = ""
     http_stage: str = ""
     http_status: int | None = None
 
@@ -188,7 +214,7 @@ def parse_login_response(xml_text: str) -> LoginResult:
         svr_text = _get_element_text(root, "svr")
         zn_text = _get_element_text(root, "zn")
 
-        server_list = parse_server_list(svr_text)
+        server_list, server_parse_summary = parse_server_list_report(svr_text)
         servers_by_index = {server.server_index: server for server in server_list}
         zone_info_list = [z for z in zn_text.split(";") if z.strip()]
 
@@ -230,6 +256,7 @@ def parse_login_response(xml_text: str) -> LoginResult:
             session_id=session_id,
             zone_list=zone_list,
             server_list=server_list,
+            server_parse_summary=server_parse_summary,
         )
     except ET.ParseError as e:
         return LoginResult(success=False, error_msg=f"XML parse error: {e}")
